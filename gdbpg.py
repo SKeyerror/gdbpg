@@ -54,10 +54,16 @@ FORMATTER_OVERRIDES = {
     },
     'Aggref': {
         'fields':{
-            'aggcollid': {'visibility': "not_null"},
-            'inputcollid': {'visibility': "not_null"},
-            'aggtranstype': {'visibility': "not_null"},
-            'location': {'visibility': "never_show"},
+            'aggcollid':     {'visibility': "not_null"},
+            'inputcollid':   {'visibility': "not_null"},
+            'aggtranstype':  {'visibility': "not_null"},
+            # PG14+: aggno/aggtransno are -1 in the parse stage; the planner
+            # assigns them.  Hide when still at the sentinel.
+            'aggno':         {'visibility': "hide_invalid"},
+            'aggtransno':    {'visibility': "hide_invalid"},
+            # PG16+: bool, defaults to false outside the presorted-input path.
+            'aggpresorted':  {'visibility': "not_null"},
+            'location':      {'visibility': "never_show"},
         },
     },
     'BoolExpr': {
@@ -252,6 +258,17 @@ FORMATTER_OVERRIDES = {
             'parent': {'formatter': 'minimal_format_node_field'},
         },
     },
+    # PG16+ introduced PlaceHolderVar.phnullingrels (mirror of Var.varnullingrels)
+    # to track outer-join nullability of the placeholder; PG17/18 kept phrels too.
+    # Hide them when the planner left them NULL (typical for non-outer-join PHVs).
+    'PlaceHolderVar': {
+        'fields':{
+            'phexpr':         {'skip_tag': True},
+            'phrels':         {'visibility': "not_null"},
+            'phnullingrels':  {'visibility': "not_null"},
+            'phlevelsup':     {'visibility': "not_null"},
+        },
+    },
     'PlannerGlobal': {
         'fields':{
             'subroots': {'formatter': 'minimal_format_node_list'},
@@ -373,12 +390,22 @@ FORMATTER_OVERRIDES = {
     },
     'Var': {
         'fields':{
-            'varno': {'formatter': "format_varno_field"},
-            'vartypmod': {'visibility': "hide_invalid"},
-            'varcollid': {'visibility': "not_null"},
-            'varlevelsup': {'visibility': "not_null"},
-            'varoattno': {'visibility': "hide_invalid"},
-            'location': {'visibility': "never_show"},
+            'varno':            {'formatter': "format_varno_field"},
+            'vartypmod':        {'visibility': "hide_invalid"},
+            'varcollid':        {'visibility': "not_null"},
+            # PG16+: RT indexes of outer joins that can null this Var.  The
+            # planner only allocates this Bitmapset when the Var actually sits
+            # below an outer join, so a NULL pointer (common case) is hidden.
+            'varnullingrels':   {'visibility': "not_null"},
+            'varlevelsup':      {'visibility': "not_null"},
+            # PG18+: RETURNING old/new flavor selector (VAR_RETURNING_DEFAULT=0
+            # is the common case for non-RETURNING Vars).
+            'varreturningtype': {'visibility': "not_null"},
+            # PG14+: replaces the GP-era 'varoattno' / 'varnoold'.  When 0 the
+            # Var carries no separate syntactic alias, so hide them.
+            'varnosyn':         {'visibility': "not_null"},
+            'varattnosyn':      {'visibility': "not_null"},
+            'location':         {'visibility': "never_show"},
         },
     },
     # Plan Nodes
@@ -687,14 +714,43 @@ def format_node(node, indent=0):
         retval = format_node_list(node, 0, True)
 
     elif is_a(node, 'String'):
-        node = cast(node, 'Value')
-
-        retval = 'String [%s]' % getchars(node['val']['str'])
+        # PG15+ removed the Value node; String/Integer/Float/Boolean/
+        # BitString are standalone structs with their own fields.
+        try:
+            node = cast(node, 'String')
+            retval = 'String [%s]' % getchars(node['sval'])
+        except gdb.error:
+            node = cast(node, 'Value')
+            retval = 'String [%s]' % getchars(node['val']['str'])
 
     elif is_a(node, 'Integer'):
-        node = cast(node, 'Value')
+        try:
+            node = cast(node, 'Integer')
+            retval = 'Integer [%s]' % node['ival']
+        except gdb.error:
+            node = cast(node, 'Value')
+            retval = 'Integer [%s]' % node['val']['ival']
 
-        retval = 'Integer [%s]' % node['val']['ival']
+    elif is_a(node, 'Float'):
+        try:
+            node = cast(node, 'Float')
+            retval = 'Float [%s]' % getchars(node['fval'])
+        except gdb.error:
+            node = cast(node, 'Value')
+            retval = 'Float [%s]' % getchars(node['val']['str'])
+
+    elif is_a(node, 'Boolean'):
+        # PG15+ only
+        node = cast(node, 'Boolean')
+        retval = 'Boolean [%s]' % node['boolval']
+
+    elif is_a(node, 'BitString'):
+        try:
+            node = cast(node, 'BitString')
+            retval = 'BitString [%s]' % getchars(node['bsval'])
+        except gdb.error:
+            node = cast(node, 'Value')
+            retval = 'BitString [%s]' % getchars(node['val']['str'])
 
     elif is_a(node, 'OidList'):
         retval = 'OidList: %s' % format_oid_list(node)
@@ -750,6 +806,14 @@ def is_joinnode(node):
     return False
 
 def format_a_const(node, indent=0):
+    # PG15+: a NULL constant is A_Const.isnull = true and the val union
+    # is not meaningful (pre-PG15 it was a Value node of type T_Null)
+    try:
+        if node['isnull']:
+            return add_indent("A_Const [NULL]", indent)
+    except gdb.error:
+        pass
+
     retval = "A_Const [%(val)s]" % {
         'val': format_node(node['val'].address),
         }
@@ -779,6 +843,21 @@ def is_node(l):
 
     try:
         x = l['type']
+        # PG19 added a NodeTag at the head of struct Bitmapset (for memory
+        # tracking).  That makes `l['type']` succeed here even though
+        # Bitmapset still has a dedicated inline formatter
+        # (format_bitmapset_field) and must NOT be routed through the
+        # complex-node-field path; otherwise visibility filters like
+        # 'not_null' on Var.varnullingrels stop applying and the hex
+        # spills out after the field bracket.
+        try:
+            tag = get_base_datatype_string(l)
+        except Exception:
+            tag = ''
+        # Match "Bitmapset" or "struct Bitmapset" -- gdb's struct-tag
+        # convention varies across versions / typedef chains.
+        if tag in ('Bitmapset', 'struct Bitmapset'):
+            return False
         return True
     except:
         return False
