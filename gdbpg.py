@@ -2,6 +2,9 @@ import gdb
 import gdb.types
 import string
 
+# One level of tree indentation in pgprint output ("\t" for a tab)
+INDENT_STRING = "    "
+
 # Visibility options
 NOT_NULL = "not_null"
 HIDE_INVALID = "hide_invalid"
@@ -889,7 +892,7 @@ def add_indent(val, indent, add_newline=False):
     if add_newline == True:
         retval += '\n'
 
-    retval += "\n".join([(("\t" * indent) + l) for l in val.split("\n")])
+    retval += "\n".join([((INDENT_STRING * indent) + l) for l in val.split("\n")])
     return retval
 
 def getchars(arg):
