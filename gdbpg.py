@@ -1,5 +1,6 @@
 import gdb
 import gdb.types
+import re
 import string
 
 # One level of tree indentation in pgprint output ("\t" for a tab)
@@ -172,6 +173,15 @@ FORMATTER_OVERRIDES = {
             'ecxt_estate': {'visibility': "never_show"},
         },
     },
+    'ExprState': {
+        'fields':{
+            # Back-pointer to the owning PlanState.  Following it dumps the
+            # whole plan state again for every ExprState hanging off it
+            # (qual, ps_ProjInfo->pi_state, ...), which grows exponentially
+            # with max_recursion_depth.
+            'parent': {'formatter': 'minimal_format_node_field'},
+        },
+    },
     'IndexOptInfo': {
         'fields': {
             'rel': {'formatter': 'minimal_format_node_field', }
@@ -218,6 +228,13 @@ FORMATTER_OVERRIDES = {
             'nextchild': {'formatter': "minimal_format_memory_context_data_field"},
         },
     },
+    'AllocSetContext': {
+        'fields':{
+            # GPDB only.  An accounting root points at itself, so recursing
+            # into it just repeats the same context until the depth limit.
+            'accountingParent': {'formatter': "minimal_format_memory_context_data_field"},
+        },
+    },
     'NullIfExpr': {
         'fields': {
             'args': {'skip_tag': True},
@@ -238,6 +255,27 @@ FORMATTER_OVERRIDES = {
             'paramtypmod': {'visibility': "hide_invalid"},
             'paramcollid': {'visibility': "not_null"},
             'location': {'visibility': "never_show"},
+        },
+    },
+    # Not a Node: dumped through the pseudo-node path.  The datums/kind/
+    # indexes arrays carry no length of their own -- their size comes from
+    # ndatums/strategy sitting in the same struct, so they need dedicated
+    # formatters instead of being shown as bare pointers.
+    'PartitionBoundInfoData': {
+        'fields': {
+            'strategy': {'formatter': 'format_char_field'},
+            'datums': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_datums_field',
+                },
+            'kind': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_kind_field',
+                },
+            'indexes': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_indexes_field',
+                },
         },
     },
     'PartitionBoundSpec': {
@@ -275,6 +313,11 @@ FORMATTER_OVERRIDES = {
     'PlannerGlobal': {
         'fields':{
             'subroots': {'formatter': 'minimal_format_node_list'},
+            # PG19: list of C strings, not of String nodes
+            'subplanNames': {
+                'visibility': "not_null",
+                'formatter': 'format_string_list_field',
+            },
         },
     },
     'PlannerInfo': {
@@ -286,6 +329,13 @@ FORMATTER_OVERRIDES = {
             'simple_rte_array': {'visibility': 'never_show'},
             'upper_rels': {'formatter': 'minimal_format_node_field'},
             'upper_targets': {'formatter': 'minimal_format_node_field'},
+            # Lists of plain C structs (no NodeTag): only the List itself can
+            # be shown, walking the cells as Nodes reads garbage tags.
+            'list_cteplaninfo': {'formatter': 'minimal_format_node_field'},
+            'part_schemes': {'formatter': 'minimal_format_node_field'},
+            'partition_selector_candidates': {'formatter': 'minimal_format_node_field'},
+            # A MemoryContext is a Node, but its guts are of no interest here
+            'planner_cxt': {'formatter': 'minimal_format_memory_context_data_field'},
         },
     },
     'Query': {
@@ -587,12 +637,116 @@ def is_old_style_list(l):
     except:
         return False
 
+def read_node_tag(node):
+    '''read the NodeTag at the head of 'node' and return it as a string
+
+    Returns None if the tag can't be read at all.  Note that the returned
+    string is only a real tag name ("T_Var") when the memory actually holds
+    a valid NodeTag: gdb renders an out-of-range enum value as a bare
+    integer, so a non-Node (e.g. a C string in a List, see
+    format_string_list_field) comes back as something like "1919973477"
+    ('expr' read as an int32).  Feeding that to lookup_type() is what
+    produced "No type named 1919973477".
+    '''
+    try:
+        return str(cast(node, 'Node')['type'])
+    except Exception:
+        return None
+
+def is_valid_node_tag(tag):
+    '''True if 'tag' is a NodeTag enumerator name rather than raw garbage'''
+    return (tag != None) and tag.startswith('T_')
+
+def type_exists(type_name):
+    try:
+        gdb.lookup_type(type_name)
+        return True
+    except gdb.error:
+        return False
+
+# These tags name no struct at all -- they are Lists of scalars, and
+# format_node() dispatches on the tag alone.
+TAGS_WITHOUT_STRUCT = ('T_OidList', 'T_IntList', 'T_XidList')
+
+def unknown_node_string(node):
+    '''describe why 'node' can't be dumped as a Node, None if it can be
+
+    Anything that walks a struct generically will sooner or later be handed
+    a pointer that is not a Node (a List of C strings, a List of plain
+    structs like PlannerInfo.part_schemes, freed memory, ...).  Describe it
+    instead of letting the cast blow up the whole dump.
+    '''
+    if not is_node(node):
+        return "<not a node: (%s) %s>" % (node.type, node)
+
+    tag = read_node_tag(node)
+    if not is_valid_node_tag(tag):
+        return "<unknown NodeTag %s at %s>" % (tag, node)
+
+    if tag in TAGS_WITHOUT_STRUCT:
+        return None
+
+    type_name = format_type(tag)
+    if not type_exists(type_name):
+        return "<%s at %s: no debug info for struct %s>" % (tag, node, type_name)
+
+    return None
+
+def as_list(lst):
+    '''cast 'lst' to (List *) so that the List members can be read
+
+    format_node() dispatches on the NodeTag while still holding a (Node *)
+    -- e.g. every cell of Agg.groupingSets is an IntList reached that way.
+    Reading ['length'] or ['head'] off that (Node *) fails with "There is
+    no member named length".
+    '''
+    try:
+        if get_base_datatype_string(lst) in ('List', 'struct List'):
+            return lst
+        return cast(lst, 'List')
+    except gdb.error:
+        return lst
+
+def list_cell_scalar_member(lst):
+    '''name of the ListCell union member holding the values of a scalar List
+
+    An IntList holds signed ints; reading them out of 'oid_value' (unsigned)
+    turns -1 into 4294967295.
+    '''
+    members = {
+        'T_IntList': 'int_value',
+        'T_XidList': 'xid_value',
+    }
+    return members.get(read_node_tag(lst), 'oid_value')
+
+def read_list_cell_scalar(cell, member):
+    try:
+        return int(cell[member])
+    except gdb.error:
+        # xid_value only exists since PG13; older ListCells stop at oid_value
+        return int(cell['oid_value'])
+
+def list_elements(lst):
+    '''yield the pointer value of every cell of 'lst' (old and new style)'''
+    lst = as_list(lst)
+    if is_old_style_list(lst):
+        item = lst['head']
+        while str(item) != '0x0':
+            yield item['data']['ptr_value']
+            item = item['next']
+    else:
+        for col in range(0, int(lst['length'])):
+            yield lst['elements'][col]['ptr_value']
+
 def format_oid_list(lst, indent=0):
     'format list containing Oid values directly (not warapped in Node)'
 
     # handle NULL pointer (for List we return NIL)
     if (str(lst) == '0x0'):
         return '(NIL)'
+
+    lst = as_list(lst)
+    member = list_cell_scalar_member(lst)
 
     # we'll collect the formatted items into a Python list
     tlist = []
@@ -602,15 +756,15 @@ def format_oid_list(lst, indent=0):
         # walk the list until we reach the last item
         while str(item) != '0x0':
 
-            # get item from the list and just grab 'oid_value as int'
-            tlist.append(int(item['data']['oid_value']))
+            # get item from the list and just grab the scalar value as int
+            tlist.append(read_list_cell_scalar(item['data'], member))
 
             # next item
             item = item['next']
     else:
-        for col in range(0, lst['length']):
+        for col in range(0, int(lst['length'])):
             element = lst['elements'][col]
-            tlist.append(int(element['oid_value']))
+            tlist.append(read_list_cell_scalar(element, member))
 
     return add_indent(str(tlist), indent)
 
@@ -621,6 +775,8 @@ def format_node_list(lst, indent=0, newline=False):
     # handle NULL pointer (for List we return NIL)
     if (str(lst) == '0x0'):
         return add_indent('(NULL)', indent)
+
+    lst = as_list(lst)
 
     # we'll collect the formatted items into a Python list
     tlist = []
@@ -641,7 +797,7 @@ def format_node_list(lst, indent=0, newline=False):
             # next item
             item = item['next']
     else:
-        for col in range(0, lst['length']):
+        for col in range(0, int(lst['length'])):
             element = lst['elements'][col]
             node = cast(element['ptr_value'], 'Node')
             tlist.append(format_node(node))
@@ -673,6 +829,200 @@ def format_bitmapset(bitmapset):
     return retval
 
 
+# ---
+# PartitionBoundInfoData related dumpers
+#
+# PartitionBoundInfoData is not a Node, and its datums / kind / indexes
+# members are bare pointers whose lengths live in the sibling fields
+# (ndatums, strategy, nindexes).  They can therefore only be dumped with
+# the whole boundinfo at hand.
+
+def partition_bound_strategy(boundinfo):
+    return format_char(boundinfo['strategy'])
+
+def partition_bound_natts(boundinfo, natts=None):
+    '''number of Datums in each datums[i] row, None if it cannot be derived
+
+    hash: (modulus, remainder); list: 1 value per row.  For range
+    partitioning the row width is the number of key columns (partnatts),
+    which lives in the PartitionKey, not in the boundinfo.
+    '''
+    if natts != None:
+        return natts
+
+    strategy = partition_bound_strategy(boundinfo)
+    if strategy == 'h':
+        return 2
+    if strategy == 'l':
+        return 1
+    return None
+
+def partition_bound_nindexes(boundinfo):
+    try:
+        return int(boundinfo['nindexes'])       # PG12+
+    except gdb.error:
+        pass
+
+    # PG11: the length is implicit in the strategy
+    ndatums = int(boundinfo['ndatums'])
+    strategy = partition_bound_strategy(boundinfo)
+    if strategy == 'l':
+        return ndatums
+    if strategy == 'r':
+        return ndatums + 1
+    if strategy == 'h':
+        # greatest modulus == modulus of the last (modulus, remainder) row
+        if ndatums > 0 and str(boundinfo['datums'][ndatums - 1]) != '0x0':
+            return int(boundinfo['datums'][ndatums - 1][0])
+    return None
+
+def format_datum_raw(datum):
+    '''a Datum without type information: small values are almost certainly
+    by-value integers, big ones pointers of by-reference types'''
+    value = int(datum)
+    if 0 <= value < 65536:
+        return str(value)
+    return '0x%x' % (value & ((1 << 64) - 1))
+
+def format_partition_datum(datum, kind=None):
+    if kind != None:
+        kind_string = str(kind)
+        if 'MINUS_INFINITY' in kind_string or kind_string == '-1':
+            return 'MINUS_INFINITY'
+        if 'MAXVALUE' in kind_string or kind_string == '1':
+            return 'MAXVALUE'
+    return format_datum_raw(datum)
+
+def format_partition_datums(boundinfo, natts=None, indent=0):
+    datums = boundinfo['datums']
+    if str(datums) == '0x0':
+        return add_indent('(NULL)', indent)
+
+    ndatums = int(boundinfo['ndatums'])
+    strategy = partition_bound_strategy(boundinfo)
+    row_natts = partition_bound_natts(boundinfo, natts)
+
+    kind = None
+    try:
+        if str(boundinfo['kind']) != '0x0':
+            kind = boundinfo['kind']
+    except gdb.error:
+        pass
+
+    lines = ["(strategy='%s' ndatums=%d)" % (strategy, ndatums)]
+    if row_natts == None:
+        lines.append(INDENT_STRING + "<range bounds: partnatts is not stored"
+                     " in the boundinfo, showing 1 Datum per row;"
+                     " use 'pgprint <expr> <natts>' for multi-column keys>")
+        row_natts = 1
+
+    for i in range(ndatums):
+        row = datums[i]
+        if str(row) == '0x0':
+            lines.append(INDENT_STRING + '[%d] (NULL)' % i)
+            continue
+
+        values = []
+        for col in range(row_natts):
+            col_kind = None
+            if kind != None and str(kind[i]) != '0x0':
+                col_kind = kind[i][col]
+            values.append(format_partition_datum(row[col], col_kind))
+        lines.append(INDENT_STRING + '[%d] (%s)' % (i, ', '.join(values)))
+
+    return add_indent('\n'.join(lines), indent)
+
+def format_partition_kind(boundinfo, natts=None, indent=0):
+    kind = boundinfo['kind']
+    if str(kind) == '0x0':
+        return add_indent('(NULL)', indent)
+
+    ndatums = int(boundinfo['ndatums'])
+    row_natts = partition_bound_natts(boundinfo, natts)
+    if row_natts == None:
+        row_natts = 1
+
+    lines = ['(ndatums=%d)' % ndatums]
+    for i in range(ndatums):
+        row = kind[i]
+        if str(row) == '0x0':
+            lines.append(INDENT_STRING + '[%d] (NULL)' % i)
+            continue
+        values = [str(row[col]) for col in range(row_natts)]
+        lines.append(INDENT_STRING + '[%d] (%s)' % (i, ', '.join(values)))
+
+    return add_indent('\n'.join(lines), indent)
+
+def format_partition_indexes(boundinfo, indent=0):
+    indexes = boundinfo['indexes']
+    if str(indexes) == '0x0':
+        return add_indent('(NULL)', indent)
+
+    nindexes = partition_bound_nindexes(boundinfo)
+    if nindexes == None:
+        return add_indent('<cannot determine the length of indexes[]>', indent)
+
+    values = [str(int(indexes[i])) for i in range(nindexes)]
+    return add_indent('(nindexes=%d) [%s]' % (nindexes, ', '.join(values)),
+                      indent)
+
+PARTITION_BOUND_MEMBERS = ('datums', 'kind', 'indexes')
+
+def print_partition_bound_member(expr, natts=None):
+    '''handle 'pgprint boundinfo->datums' (and ->kind / ->indexes)
+
+    The member pointer alone is undumpable, so re-evaluate the parent
+    expression and dump the member with the boundinfo's context.  Returns
+    True when the expression was recognized and printed.
+    '''
+    m = re.match(r'^\s*(.+)(?:->|\.)\s*(%s)\s*$'
+                     % '|'.join(PARTITION_BOUND_MEMBERS), expr)
+    if m == None:
+        return False
+
+    try:
+        parent = gdb.parse_and_eval(m.group(1))
+        if get_base_datatype_string(parent) not in (
+                'PartitionBoundInfoData', 'struct PartitionBoundInfoData'):
+            return False
+        boundinfo = cast(parent, 'PartitionBoundInfoData')
+    except Exception:
+        return False
+
+    member = m.group(2)
+    if member == 'datums':
+        print(format_partition_datums(boundinfo, natts))
+    elif member == 'kind':
+        print(format_partition_kind(boundinfo, natts))
+    else:
+        print(format_partition_indexes(boundinfo))
+    return True
+
+def format_partition_datums_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
+    if str(node[field]) == '0x0':
+        if print_null:
+            return add_indent('[%s] (NULL)' % field, indent, True)
+        return ''
+    return add_indent('[%s] %s' % (field, format_partition_datums(node)),
+                      indent, True)
+
+def format_partition_kind_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
+    if str(node[field]) == '0x0':
+        if print_null:
+            return add_indent('[%s] (NULL)' % field, indent, True)
+        return ''
+    return add_indent('[%s] %s' % (field, format_partition_kind(node)),
+                      indent, True)
+
+def format_partition_indexes_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
+    if str(node[field]) == '0x0':
+        if print_null:
+            return add_indent('[%s] (NULL)' % field, indent, True)
+        return ''
+    return add_indent('[%s] %s' % (field, format_partition_indexes(node)),
+                      indent, True)
+#---
+
 def format_node_array(array, start_idx, length, indent=0):
 
     items = []
@@ -699,10 +1049,16 @@ def format_node(node, indent=0):
         else:
             return "%s <max_depth_exceeded>" % str(node)
 
-    recursion_depth += 1
-
     if str(node) == '0x0':
         return add_indent('(NULL)', indent)
+
+    # Not everything reachable from a Node is a Node.  Report it and move on
+    # rather than casting to a bogus type and aborting the whole dump.
+    unknown = unknown_node_string(node)
+    if unknown != None:
+        return add_indent(unknown, indent)
+
+    recursion_depth += 1
 
     retval = ''
 
@@ -756,10 +1112,13 @@ def format_node(node, indent=0):
             retval = 'BitString [%s]' % getchars(node['val']['str'])
 
     elif is_a(node, 'OidList'):
-        retval = 'OidList: %s' % format_oid_list(node)
+        retval = 'OidList: %s' % format_oid_list(cast(node, 'List'))
 
     elif is_a(node, 'IntList'):
-        retval = 'IntList: %s' % format_oid_list(node)
+        retval = 'IntList: %s' % format_oid_list(cast(node, 'List'))
+
+    elif is_a(node, 'XidList'):
+        retval = 'XidList: %s' % format_oid_list(cast(node, 'List'))
 
     elif is_pathnode(node):
         node_formatter = PlanStateFormatter(node)
@@ -840,15 +1199,35 @@ def is_xpr(l):
         return False
 
 def is_node(l):
-    '''return True if the value looks like a Node (has 'type' field)'''
+    '''return True if the value looks like a Node (its base struct starts with a NodeTag)
+
+    Note that a Node subtype does NOT have a member named 'type': Agg starts
+    with 'Plan plan', SeqScanState with 'ScanState ss', ...  Requiring
+    l['type'] to resolve would send 'pgprint node' at ExecInitAgg() down the
+    pseudo-node path, which dumps Agg.plan as a plain field ("[plan] <unknown
+    NodeTag None at {type = T_Agg, ...}>") instead of merging the inherited
+    Plan fields the way NodeFormatter.parent_node does.
+    '''
+    # Reject multi-level pointers (e.g. 'List **args_p' in
+    # simplify_function).  gdb's field lookup auto-dereferences through
+    # every pointer level, so l['type'] would succeed on a Node** too --
+    # but casting such a value to Node* misreads the pointer variable's
+    # own bytes as a NodeTag ("No type named <garbage>").
+    try:
+        t = l.type.strip_typedefs()
+        if (t.code == gdb.TYPE_CODE_PTR and
+                t.target().strip_typedefs().code == gdb.TYPE_CODE_PTR):
+            return False
+    except Exception:
+        pass
+
     if is_xpr(l):
         return True
 
     try:
-        x = l['type']
         # PG19 added a NodeTag at the head of struct Bitmapset (for memory
-        # tracking).  That makes `l['type']` succeed here even though
-        # Bitmapset still has a dedicated inline formatter
+        # tracking).  That makes Bitmapset look like a Node here even though
+        # it still has a dedicated inline formatter
         # (format_bitmapset_field) and must NOT be routed through the
         # complex-node-field path; otherwise visibility filters like
         # 'not_null' on Var.varnullingrels stop applying and the hex
@@ -861,9 +1240,39 @@ def is_node(l):
         # convention varies across versions / typedef chains.
         if tag in ('Bitmapset', 'struct Bitmapset'):
             return False
-        return True
+        return has_node_tag_header(l)
     except:
         return False
+
+def has_node_tag_header(l, depth=0):
+    '''True if l's base struct starts with a NodeTag
+
+    gdb happily finds a field named 'type' at any offset and of any type, but
+    only a NodeTag at offset 0 makes the value castable to Node * -- struct
+    Gang for instance has a 'GangType type' member and is not a Node at all.
+    '''
+    try:
+        # get_base_datatype() peels pointers/arrays but leaves the typedef
+        # ('PlannerInfo' rather than 'struct PlannerInfo') in place
+        t = get_base_datatype(l).strip_typedefs()
+        if t.code != gdb.TYPE_CODE_STRUCT:
+            return False
+
+        first_field = t.values()[0]
+        field_type = first_field.type
+        stripped = field_type.strip_typedefs()
+
+        if stripped.code == gdb.TYPE_CODE_ENUM:
+            return (stripped.tag == 'NodeTag') or (str(field_type) == 'NodeTag')
+
+        # Node types that embed their parent node (Scan.plan, Var.xpr, ...)
+        # still start with that parent's NodeTag.
+        if stripped.code == gdb.TYPE_CODE_STRUCT and depth < 4:
+            return has_node_tag_header(stripped, depth + 1)
+    except Exception:
+        return False
+
+    return False
 
 def is_type(value, type_name, is_pointer):
     t = gdb.lookup_type(type_name)
@@ -873,17 +1282,37 @@ def is_type(value, type_name, is_pointer):
     # This doesn't work for list types for some reason...
     # return (gdb.types.get_basic_type(value.type) == gdb.types.get_basic_type(t))
 
+def as_pointer(value):
+    '''return 'value' in a form that can be cast to a node pointer
+
+    'pgprint *node' hands us the struct itself, and so does every embedded
+    node sub-struct (Agg.plan, ScanState.ss, ...).  Casting a struct value
+    to a pointer does not dereference it, it reinterprets the first bytes of
+    the struct -- the NodeTag -- as an address ("Cannot access memory at
+    address 0x1b0").  Take the address instead; the node starts there.
+    '''
+    try:
+        if (value.type.strip_typedefs().code == gdb.TYPE_CODE_STRUCT and
+                value.address != None):
+            return value.address
+    except gdb.error:
+        pass
+
+    return value
+
 def cast(node, type_name):
     '''wrap the gdb cast to proper node type'''
 
     # lookup the type with name 'type_name' and cast the node to it
     t = gdb.lookup_type(type_name)
-    return node.cast(t.pointer())
+    return as_pointer(node).cast(t.pointer())
 
 def get_base_node_type(node):
     if is_node(node):
-        node = cast(node, "Node")
-        return format_type(node['type'])
+        tag = read_node_tag(node)
+        if not is_valid_node_tag(tag):
+            return None
+        return format_type(tag)
 
     return None
 
@@ -1052,7 +1481,8 @@ def format_optional_node_list(node, fieldname, cast_to=None, skip_tag=False, new
     retval = ''
     indent_add = 0
     if str(node[fieldname]) != '0x0':
-        if is_a(node[fieldname], 'OidList') or is_a(node[fieldname], 'IntList'):
+        if (is_a(node[fieldname], 'OidList') or is_a(node[fieldname], 'IntList')
+                or is_a(node[fieldname], 'XidList')):
             return format_optional_oid_list(node, fieldname, skip_tag, newLine, print_null, indent)
 
         if skip_tag == False:
@@ -1081,6 +1511,26 @@ def format_optional_oid_list(node, fieldname, skip_tag=False, newLine=False, pri
         retval = add_indent(retval, indent, True)
     elif print_null == True:
         retval += add_indent("[%s] (NIL)" % fieldname, indent, True)
+
+    return retval
+
+def format_string_list_field(node, fieldname, cast_to=None, skip_tag=False, newLine=False, print_null=False, indent=1):
+    '''format a List whose cells are plain C strings, not String nodes
+
+    PG19's PlannerGlobal.subplanNames is such a list ("expr", "cte_1", ...).
+    The generic list walker would cast each cell to Node * and read the first
+    four characters of the string as a NodeTag.
+    '''
+    retval = ''
+    if str(node[fieldname]) != '0x0':
+        strings = [getchars(cast(e, 'char')) for e in list_elements(node[fieldname])]
+
+        if skip_tag == False:
+            retval += '[%s] ' % fieldname
+        retval += '[%s]' % ", ".join(strings)
+        retval = add_indent(retval, indent, True)
+    elif print_null == True:
+        retval = add_indent("[%s] (NIL)" % fieldname, indent, True)
 
     return retval
 
@@ -1162,31 +1612,19 @@ def minimal_format_node_list_field(node, fieldname, cast_to=None, skip_tag=False
     # we'll collect the formatted items into a Python list
     tlist = []
 
-    if is_old_style_list(lst):
-        item = lst['head']
+    for element in list_elements(lst):
+        if str(element) == '0x0':
+            tlist.append('(NULL)')
+            continue
 
-        # walk the list until we reach the last item
-        while str(item) != '0x0':
-            lstnode = cast(item['data']['ptr_value'], 'Node')
-            nodetype = get_base_node_type(lstnode)
-            lstnode = cast(lstnode, nodetype)
+        lstnode = cast(element, 'Node')
+        unknown = unknown_node_string(lstnode)
+        if unknown != None:
+            tlist.append(unknown)
+            continue
 
-            val = "(%s)%s" % (lstnode.type, node[fieldname])
-            # append the formatted Node to the result list
-            tlist.append(val)
-
-            # next item
-            item = item['next']
-    else:
-        for col in range(0, lst['length']):
-            element = lst['elements'][col]
-            lstnode = cast(item['data']['ptr_value'], 'Node')
-            nodetype = get_base_node_type(lstnode)
-            lstnode = cast(lstnode, nodetype)
-
-            val = "(%s)%s" % (lstnode.type, node[fieldname])
-
-            tlist.append(val)
+        lstnode = cast(lstnode, get_base_node_type(lstnode))
+        tlist.append("(%s)%s" % (lstnode.type, lstnode))
 
     if newLine:
         retval = "\n".join([str(t) for t in tlist])
@@ -1198,8 +1636,18 @@ def minimal_format_node_list_field(node, fieldname, cast_to=None, skip_tag=False
 
 def minimal_format_memory_context_data_field(node, fieldname, cast_to=None, skip_tag=False, print_null=False, indent=1):
     retval = ''
-    if str(node[fieldname]) != '0x0':
-        retval = add_indent("[%s] (%s)%s [name=%s]" % (fieldname, node[fieldname].type, node[fieldname], format_string_pointer_field(node[fieldname], 'name')), indent, True)
+    value = node[fieldname]
+    if str(value) != '0x0':
+        # GPDB's AllocSetContext.accountingParent is an (AllocSet), which
+        # keeps its name in the MemoryContextData header sitting at its
+        # front rather than in a member of its own
+        header = value
+        try:
+            header['name']
+        except gdb.error:
+            header = cast(value, 'MemoryContextData')
+
+        retval = add_indent("[%s] (%s)%s [name=%s]" % (fieldname, value.type, value, format_string_pointer_field(header, 'name')), indent, True)
     elif print_null == True:
         retval = add_indent("[%s] (NIL)" % fieldname, indent, True)
 
@@ -1226,6 +1674,35 @@ def format_pseudo_node_field(node, fieldname, cast_to=None, skip_tag=False, prin
 
 # ---
 # TupleTableSlot related dumpers
+def tuple_desc_attr(desc, i):
+    '''(Form_pg_attribute) of the i'th attribute of the TupleDesc 'desc'
+
+    The layout of that array has changed twice:
+
+      PG11 and older  'Form_pg_attribute *attrs' -- an array of pointers
+      PG12 .. PG17    'FormData_pg_attribute attrs[FLEXIBLE_ARRAY_MEMBER]'
+      PG18 and newer  no 'attrs' member at all -- the array sits behind the
+                      variable-length compact_attrs[natts], and is reached
+                      through TupleDescAttrAddress()
+
+    Reading desc['attrs'] on PG18+ is what produced
+    "[tts_tupleDescriptor] <error: There is no member named attrs.>".
+    '''
+    try:
+        attrs = desc['attrs']
+    except gdb.error:
+        # TupleDescAttrAddress(): the FormData_pg_attribute array starts
+        # right past the last compact_attrs element
+        attrs = (desc['compact_attrs'][0].address + int(desc['natts'])).cast(
+                    gdb.lookup_type('FormData_pg_attribute').pointer())
+        return attrs + i
+
+    attr = attrs[i]
+    if attr.type.strip_typedefs().code == gdb.TYPE_CODE_PTR:
+        return attr
+
+    return attr.address
+
 def format_tuple_descriptor(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
     if str(node[field]) == '0x0':
         return '[%s] (NULL)' % field
@@ -1233,7 +1710,7 @@ def format_tuple_descriptor(node, field, cast_to=None, skip_tag=False, print_nul
     natts = node[field]['natts']
     retval = format_pseudo_node_field(node, field, 'tupleDesc' , skip_tag, print_null, 0)
     for col in range(0, natts):
-        attr = node[field]['attrs'][col]
+        attr = tuple_desc_attr(node[field], col)
         formatter = LabelNodeFormatter(attr, pseudo_node=True, label='[%s] ' % (col+1))
         retval += add_indent(formatter.format(), 1, True)
 
@@ -1292,7 +1769,6 @@ def format_tts_values(node, field, cast_to=None, skip_tag=False, print_null=Fals
 
     descr = node['tts_tupleDescriptor'].dereference()
     natts = descr['natts']
-    attrs = descr['attrs']
 
     nullmap, nullmap_bytes = get_tts_nullmap(node, 'PRIVATE_tts_isnull', natts)
 
@@ -1301,14 +1777,13 @@ def format_tts_values(node, field, cast_to=None, skip_tag=False, print_null=Fals
     values = node[field]
     tts_values_list = []
     for col in range(0, natts):
-        attr = attrs[col].dereference()
         tts_values_list.append("[%d] 0x%08x" % (col + 1, values[col]))
 
     values_retval = '\n'.join([line for line in tts_values_list])
 
     formatted_tuple_list= []
     for col in range(0, natts):
-        attr = attrs[col].dereference()
+        attr = tuple_desc_attr(descr, col).dereference()
         formatted_tuple_list.append("[%d] %s" % (col + 1, format_tuple_value(values[col], nullmap[col], attr)))
 
     formatted_tuples_retval  = '\n'.join([line for line in formatted_tuple_list])
@@ -1453,12 +1928,17 @@ class NodeFormatter(object):
                 #    raise Exception("Must use a pointer for pseudo node types")
             else:
                 self._type_string = get_base_node_type(node)
+                if self._type_string == None:
+                    raise gdb.error("%s does not look like a Node" % node)
                 self._base_type = gdb.lookup_type(self._type_string)
                 self._node_type = self._base_type.pointer()
         else:
             self._type_string = typecast
             self._base_type = gdb.lookup_type(self.type_string)
             self._node_type = self._base_type.pointer()
+
+        if self._node_type.strip_typedefs().code == gdb.TYPE_CODE_PTR:
+            node = as_pointer(node)
 
         self._node = node.cast(self._node_type)
 
@@ -1684,7 +2164,11 @@ class NodeFormatter(object):
         return self._regular_fields
 
     def is_type(self, value, type_name):
-        t = gdb.lookup_type(type_name)
+        try:
+            t = gdb.lookup_type(type_name)
+        except gdb.error:
+            # no such type in this binary (e.g. no 'List' outside postgres)
+            return False
         return (get_base_datatype(value) == get_base_datatype(t))
 
     def field_datatype(self, field):
@@ -1765,8 +2249,18 @@ class NodeFormatter(object):
         return retval
 
     def format_regular_field(self, field):
+        global recursion_depth
+
         display_method = self.get_display_method(field)
-        return display_method(self._node, field)
+        depth = recursion_depth
+        try:
+            return display_method(self._node, field)
+        except Exception as e:
+            # One unreadable field must not cost us the whole dump.  A field
+            # that threw halfway through format_node() left recursion_depth
+            # raised, so put it back.
+            recursion_depth = depth
+            return "<%s: %s>" % (type(e).__name__, e)
 
     def format_complex_fields(self):
         retval = ""
@@ -1783,6 +2277,8 @@ class NodeFormatter(object):
         return retval
 
     def format_complex_field(self, field):
+        global recursion_depth
+
         display_mode = self.get_display_mode(field)
         print_null = False
         if display_mode == NEVER_SHOW:
@@ -1793,7 +2289,12 @@ class NodeFormatter(object):
         skip_tag = self.is_skip_tag(field)
 
         display_method = self.get_display_method(field)
-        return display_method(self._node, field, skip_tag=skip_tag, print_null=print_null)
+        depth = recursion_depth
+        try:
+            return display_method(self._node, field, skip_tag=skip_tag, print_null=print_null)
+        except Exception as e:
+            recursion_depth = depth
+            return add_indent("[%s] <%s: %s>" % (field, type(e).__name__, e), 1, True)
 
     def format_all_regular_fields(self, offset):
         formatted_fields = []
@@ -1846,14 +2347,58 @@ class PgPrintCommand(gdb.Command):
         global recursion_depth
 
         arg_list = gdb.string_to_argv(arg)
-        if len(arg_list) != 1:
-            print("usage: pgprint var")
+        if len(arg_list) not in (1, 2):
+            print("usage: pgprint var [natts]")
             return
+
+        # Optional row width for arrays whose element count is not stored
+        # next to them (range-partition boundinfo->datums rows).
+        natts = None
+        if len(arg_list) == 2:
+            try:
+                natts = int(arg_list[1])
+            except ValueError:
+                print("usage: pgprint var [natts]")
+                return
         recursion_depth = 0
 
         l = gdb.parse_and_eval(arg_list[0])
 
+        # Peel off extra pointer levels (e.g. 'pgprint args_p' where
+        # args_p is a 'List **' function argument) so the user doesn't
+        # have to type '*args_p' themselves.
+        while True:
+            t = l.type.strip_typedefs()
+            if (t.code != gdb.TYPE_CODE_PTR or
+                    t.target().strip_typedefs().code != gdb.TYPE_CODE_PTR):
+                break
+            if int(l) == 0:
+                print("(NULL)")
+                return
+            l = l.dereference()
+
         if not is_node(l):
+            # Members of a PartitionBoundInfoData (boundinfo->datums, ...)
+            # can only be sized with the ndatums/strategy sitting next to
+            # them, so route them through the boundinfo-aware dumper.
+            if print_partition_bound_member(arg_list[0], natts):
+                return
+
+            # The pseudo-node dump walks struct members; scalars, enums and
+            # pointers to scalars (e.g. a bare 'Datum *') have none, and
+            # NodeFormatter would die with "Type is not a structure, union,
+            # enum, or function type."
+            try:
+                # get_base_datatype() peels pointers but can leave a typedef
+                # (e.g. 'PartitionBoundInfoData') in place, so strip it
+                # before looking at the type code
+                base_code = get_base_datatype(l).strip_typedefs().code
+            except Exception:
+                base_code = None
+            if base_code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+                print("(%s) %s" % (l.type, l))
+                return
+
             print("not a node type")
             print("running experimental dump...")
             formatter = NodeFormatter(l, pseudo_node=True)
