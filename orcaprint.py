@@ -5,11 +5,18 @@ import re
 
 class SilenceGDBWarnings:
     """Temporarily redirect GDB internal warnings to /dev/null,
-    while keeping Python print() output visible."""
+    while keeping Python print() output visible.
+
+    print() 的输出先缓存在内存里，等关闭日志重定向后再统一经 gdb.write
+    输出。不能直接写 sys.__stdout__：那会绕过 gdb 的终端处理，缓冲区在
+    (gdb) 提示符之后才刷出，此时终端处于 readline 模式，\\n 不回到行首，
+    输出变成阶梯状并和提示符交错。"""
     def __enter__(self):
         # 先保存原 stdout/stderr
         self.old_stdout = sys.stdout
         self.old_stderr = sys.stderr
+
+        gdb.execute("set width 0", to_string=True)   # 不限制行宽，避免自动换行
 
         # 打开 GDB 的日志重定向
         gdb.execute("set logging file /dev/null")
@@ -17,22 +24,49 @@ class SilenceGDBWarnings:
         gdb.execute("set logging overwrite on")
         gdb.execute("set logging enabled on")
 
-        # 让 Python 的 print() 直接写真实终端
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
-
-        gdb.execute("set width 0", to_string=True)   # 不限制行宽，避免自动换行
-
+        # Python 的 print() 先写入缓冲区
+        self.buf = io.StringIO()
+        sys.stdout = self.buf
+        sys.stderr = self.buf
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # 关闭 GDB 日志重定向
-        gdb.execute("set logging off")
-
         # 恢复 Python 输出
         sys.stdout = self.old_stdout
         sys.stderr = self.old_stderr
 
+        # 关闭 GDB 日志重定向
+        gdb.execute("set logging enabled off")
+        gdb.execute("set logging redirect off")
+
+        # 经 gdb 的输出流写到终端，即使中途抛异常也把已缓存部分输出
+        gdb.write(self.buf.getvalue())
+        gdb.flush()
+
 MAX_INDENT = 12  # 最多缩进 12 层（自己可调）
+MAX_ARRAY_ELEMS = 100000  # 数组长度上限，超过视为脏内存
+MAX_DEPTH = 200           # 递归深度上限，防止环/野指针无限递归
+
+# 已释放/未初始化内存的典型填充值 (PG CLOBBER_FREED_MEMORY = 0x7F, GPOS/glibc 常见填充)
+_CLOBBER_PATTERNS = {0x7F7F7F7F, 0x7F7F7F7F7F7F7F7F, 0xCDCDCDCD, 0xCDCDCDCDCDCDCDCD,
+                     0xDEADBEEF, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF}
+
+def array_size(arr):
+    """读取 CDynamicPtrArray 的 m_size 并做合法性检查。
+
+    指向已释放内存时 m_size 会是 0x7F7F7F7F 之类的垃圾值，直接
+    range(m_size) 会让 gdb 跑上几天且 Ctrl-C 无效，所以这里提前拒绝。"""
+    size = int(arr['m_size'])
+    cap = None
+    try:
+        cap = int(arr['m_capacity'])
+    except Exception:
+        pass
+    if (size < 0 or size > MAX_ARRAY_ELEMS or (size & 0xFFFFFFFFFFFFFFFF) in _CLOBBER_PATTERNS
+            or (cap is not None and size > cap)):
+        raise gdb.GdbError(f"bogus array m_size={size:#x} capacity={cap if cap is None else hex(cap)} "
+                           f"@ {arr.address} (freed or uninitialized memory?)")
+    return size
 
 def mkpad(depth):
     d = depth
@@ -94,7 +128,7 @@ def get_dynamic_ptr_array_list(array_ptr, item_type="ULONG"):
 
     res = []
     array_obj = array_ptr.dereference()
-    size = int(array_obj['m_size'])
+    size = array_size(array_obj)
     elems = array_obj['m_elems']
 
     for i in range(size):
@@ -131,7 +165,7 @@ def print_cdxltabledescr(val):
             print("    (no columns)")
         else:
             try:
-                num = int(cols['m_size'])
+                num = array_size(cols.dereference())
                 arr = cols['m_elems']
                 for i in range(num):
                     col = safe_deref((arr + i).dereference())
@@ -151,6 +185,9 @@ def print_cdxltabledescr(val):
 
 def print_cdxlnode(val, depth=0, suffix=""):
     pad = mkpad(depth)
+    if depth > MAX_DEPTH:
+        print(pad + f"  [warn] depth > {MAX_DEPTH}, stop (cycle or garbage?)")
+        return
     # print(pad + f"CDXLNode @ {val.address}")
     m_op = val['m_dxl_op']
     m_children = val['m_dxl_array']
@@ -158,6 +195,11 @@ def print_cdxlnode(val, depth=0, suffix=""):
     # 动态类型判断
     dyn_type = str(m_op.dynamic_type).split("::")[-1]
     dyn_type = dyn_type.rstrip().rstrip('*').rstrip()
+    # 动态类型解析成抽象基类，说明 vtable 已失效，对象多半已被释放
+    if dyn_type == "CDXLOperator":
+        print(pad + f"  [warn] CDXLNode @ {val.address}: m_dxl_op has no valid vtable, "
+              "node is likely freed/uninitialized -- not expanding")
+        return
 
     # 增加 suffix 用于显示 (args), (aggorder) 等
     header = pad + f"  ▶ {dyn_type}"
@@ -202,7 +244,7 @@ def print_cdxlnode(val, depth=0, suffix=""):
         # 打印出该列表包含多少个元素
         num_items = 0
         if m_children != 0:
-            num_items = int(m_children['m_size'])
+            num_items = array_size(m_children.dereference())
         print(header + f"  [items: {num_items}]")
 
     else:
@@ -210,7 +252,7 @@ def print_cdxlnode(val, depth=0, suffix=""):
 
     if m_children != 0:
         try:
-            num = int(m_children['m_size'])
+            num = array_size(m_children.dereference())
             arr = m_children['m_elems']
 
             # 定义 Aggref 子节点的标签映射
@@ -356,6 +398,9 @@ def get_scalar_const_value_str(pop):
 #                 print(pad + f"  [warn] cannot expand children: {e}", flush=True)
 def print_cexpression(val, depth=0, suffix=""):
     pad = mkpad(depth)
+    if depth > MAX_DEPTH:
+        print(pad + f"  [warn] depth > {MAX_DEPTH}, stop (cycle or garbage?)")
+        return
     pop = val['m_pop'] if _has_field(val, 'm_pop') else 0
     if pop == 0:
         return
@@ -408,7 +453,7 @@ def print_cexpression(val, depth=0, suffix=""):
     if _has_field(val, 'm_pdrgpexpr') and val['m_pdrgpexpr'] != 0:
         try:
             arr = val['m_pdrgpexpr'].dereference()
-            num = int(arr['m_size'])
+            num = array_size(arr)
             elems = arr['m_elems']
 
             for i in range(num):
@@ -433,12 +478,15 @@ def print_cexpression(val, depth=0, suffix=""):
 def print_cdparray(val, depth=0):
     """Generic pretty printer for CDynamicPtrArray<T, Cleanup*> (including nested types)."""
     pad = mkpad(depth)
+    if depth > MAX_DEPTH:
+        print(pad + f"  [warn] depth > {MAX_DEPTH}, stop (cycle or garbage?)")
+        return
     print(pad + "=" * 60, flush=True)
     tname = str(val.type.strip_typedefs())
     print(pad + f"{tname} @ {val.address}", flush=True)
 
     try:
-        size = int(val['m_size'])
+        size = array_size(val)
         capacity = int(val['m_capacity'])
         print(pad + f"  size     = {size}", flush=True)
         print(pad + f"  capacity = {capacity}", flush=True)
@@ -494,6 +542,57 @@ def print_cdparray(val, depth=0):
 
 
 
+_SIMPLE_EXPR = re.compile(r'\s*\*?\s*([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*(?:\s*\(\s*\))?|\s*\[\s*\d+\s*\])*)\s*$')
+_SIMPLE_STEP = re.compile(r'\s*(?:(->|\.)\s*([A-Za-z_]\w*)(\s*\(\s*\))?|\[\s*(\d+)\s*\])')
+
+def _find_field(typ, want):
+    """在类型及其基类中找名字(忽略大小写)为 want 的字段，返回真实字段名。"""
+    typ = typ.strip_typedefs()
+    if typ.code == gdb.TYPE_CODE_PTR:
+        typ = typ.target().strip_typedefs()
+    for f in typ.fields():
+        if f.is_base_class:
+            r = _find_field(f.type, want)
+            if r:
+                return r
+        elif f.name and f.name.lower() == want:
+            return f.name
+    return None
+
+def eval_simple(arg):
+    """不经过 gdb 的 C++ 表达式解析器求值 a->b.c[2]->Pfoo() 这类简单链。
+
+    在 ORCA 代码里 gdb 解析 `x->name` 时会对 name 做符号查找(判断是否类型名)，
+    遇到大量 `using namespace gpos/gpopt/...` 时 cp_lookup_symbol_via_imports
+    递归穷举，CPU 100% 且 Ctrl-C/SIGTERM 都无效；连 `p pqc->m_pexpr` 都会卡死。
+    这里只对首个变量名做局部查找，字段用 Python API 访问；访问器方法 Pfoo()
+    映射到同名成员 m_pfoo(ORCA 命名惯例)，不做 inferior call。
+    返回 None 表示不是简单链，由调用者回退到 parse_and_eval。"""
+    m = _SIMPLE_EXPR.match(arg)
+    if not m:
+        return None
+    base, rest = m.group(1), m.group(2)
+    try:
+        val = gdb.selected_frame().read_var(base)
+    except (ValueError, gdb.error):
+        sym = gdb.lookup_global_symbol(base) or gdb.lookup_static_symbol(base)
+        if sym is None:
+            raise gdb.GdbError(f"orcaprint: no variable '{base}' in current frame")
+        val = sym.value()
+    for st in _SIMPLE_STEP.finditer(rest):
+        _, name, call, idx = st.groups()
+        if idx is not None:
+            val = val[int(idx)]
+            continue
+        field = name
+        if call:
+            field = _find_field(val.type, "m_" + name.lower())
+            if field is None:
+                raise gdb.GdbError(f"orcaprint: cannot map method {name}() to a member "
+                                   f"of {val.type}; use the m_xxx field name instead")
+        val = val[field]
+    return val
+
 class ORCAPrint(gdb.Command):
     """ORCAPrint <var> -- Pretty print gpdxl structures (CDXLTableDescr / CDXLNode)"""
 
@@ -501,11 +600,15 @@ class ORCAPrint(gdb.Command):
         super(ORCAPrint, self).__init__("orcaprint", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
+        # 空回车不重复执行：卡住时连按回车会排队 N 次同样的打印
+        self.dont_repeat()
         if not arg:
             print("Usage: orcaprint <variable>")
             return
 
-        val = gdb.parse_and_eval(arg)
+        val = eval_simple(arg)
+        if val is None:
+            val = gdb.parse_and_eval(arg)
         val = safe_deref(val)
         if val is None:
             print(f"{arg} is NULL or invalid")

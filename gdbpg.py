@@ -1,7 +1,9 @@
 import gdb
 import gdb.types
+import datetime
 import re
 import string
+import struct
 
 # One level of tree indentation in pgprint output ("\t" for a tab)
 INDENT_STRING = "    "
@@ -97,6 +99,7 @@ FORMATTER_OVERRIDES = {
     },
     'Const': {
         'fields': {
+            'constvalue': {'formatter': 'format_const_value_field'},
             'consttypmod': {'visibility': "hide_invalid"},
             'constcollid': {'visibility': "not_null"},
             'location': {'visibility': "never_show"},
@@ -260,10 +263,11 @@ FORMATTER_OVERRIDES = {
     # Not a Node: dumped through the pseudo-node path.  The datums/kind/
     # indexes arrays carry no length of their own -- their size comes from
     # ndatums/strategy sitting in the same struct, so they need dedicated
-    # formatters instead of being shown as bare pointers.
+    # formatters instead of being shown as bare pointers.  The bound Datums
+    # are decoded with the partition key in effect (see partition_key_stack).
     'PartitionBoundInfoData': {
         'fields': {
-            'strategy': {'formatter': 'format_char_field'},
+            'strategy': {'formatter': 'format_partition_strategy_field'},
             'datums': {
                   'field_type': 'node_field',
                   'formatter': 'format_partition_datums_field',
@@ -278,8 +282,151 @@ FORMATTER_OVERRIDES = {
                 },
         },
     },
+    # Not a Node.  The per-column arrays are all partnatts long and are
+    # gathered into one line per column by the [columns] summary.
+    'PartitionKeyData': {
+        'fields': {
+            'strategy': {'formatter': 'format_partition_strategy_field'},
+            'partattrs': {'visibility': "never_show"},
+            'partopfamily': {'visibility': "never_show"},
+            'partopcintype': {'visibility': "never_show"},
+            'partsupfunc': {'visibility': "never_show"},
+            'partcollation': {'visibility': "never_show"},
+            'parttypid': {'visibility': "never_show"},
+            'parttypmod': {'visibility': "never_show"},
+            'parttyplen': {'visibility': "never_show"},
+            'parttypbyval': {'visibility': "never_show"},
+            'parttypalign': {'visibility': "never_show"},
+            'parttypcoll': {'visibility': "never_show"},
+        },
+        'summary': 'format_partition_key_summary',
+    },
+    # The planner's cut-down PartitionKey (RelOptInfo.part_scheme)
+    'PartitionSchemeData': {
+        'fields': {
+            'strategy': {'formatter': 'format_partition_strategy_field'},
+            'partopfamily': {'visibility': "never_show"},
+            'partopcintype': {'visibility': "never_show"},
+            'partcollation': {'visibility': "never_show"},
+            'parttyplen': {'visibility': "never_show"},
+            'parttypbyval': {'visibility': "never_show"},
+            'partsupfunc': {'visibility': "never_show"},
+        },
+        'summary': 'format_partition_key_summary',
+    },
+    # Not a Node.  oids/is_leaf are nparts long; [partitions] pairs them
+    # with the bounds from boundinfo.
+    'PartitionDescData': {
+        'fields': {
+            'oids': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_sized_array_field',
+                },
+            'is_leaf': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_sized_array_field',
+                },
+            'boundinfo': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_pseudo_node_field',
+                },
+        },
+        'summary': 'format_partition_desc_summary',
+    },
+    # Not a Node: a dynahash table of PartitionDirectoryEntry
+    'PartitionDirectoryData': {
+        'fields': {
+            'pdir_mcxt': {
+                  'field_type': 'node_field',
+                  'formatter': 'minimal_format_memory_context_data_field',
+                },
+            'pdir_hash': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_directory_hash_field',
+                },
+        },
+    },
+    'PartitionDirectoryEntry': {
+        'fields': {
+            'rel': {'formatter': 'format_relation_brief_field'},
+            'pd': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_field_with_key',
+                },
+        },
+    },
+    # execPartition.c's per-level tuple routing state: carries both the
+    # key and the partdesc, so the bounds can be decoded exactly
+    'PartitionDispatchData': {
+        'fields': {
+            'reldesc': {'formatter': 'format_relation_brief_field'},
+            'key': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_pseudo_node_field',
+                },
+            'partdesc': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_field_with_key',
+                },
+            'indexes': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_sized_array_field',
+                },
+        },
+    },
+    'PartitionPruneContext': {
+        'fields': {
+            'strategy': {'formatter': 'format_partition_strategy_field'},
+            'boundinfo': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_field_with_key',
+                },
+            'partcollation': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_sized_array_field',
+                },
+            'partsupfunc': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_sized_array_field',
+                },
+        },
+    },
+    # The relcache entry holds the key next to the partdesc(s)
+    'RelationData': {
+        'fields': {
+            'rd_rel': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_pseudo_node_field',
+                },
+            'rd_partkey': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_pseudo_node_field',
+                },
+            'rd_partdesc': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_field_with_key',
+                },
+            'rd_partdesc_nodetached': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_field_with_key',
+                },
+        },
+    },
+    'RelOptInfo': {
+        'fields': {
+            'part_scheme': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_pseudo_node_field',
+                },
+            'boundinfo': {
+                  'field_type': 'node_field',
+                  'formatter': 'format_partition_field_with_key',
+                },
+        },
+    },
     'PartitionBoundSpec': {
         'fields': {
+            'strategy': {'formatter': 'format_partition_strategy_field'},
             'everyGenList': {'formatter': 'format_everyGenList_node'},
             'location': {'visibility': "never_show"},
         },
@@ -291,6 +438,7 @@ FORMATTER_OVERRIDES = {
     },
     'PartitionSpec': {
         'fields': {
+            'strategy': {'formatter': 'format_partition_strategy_field'},
             'location': {'visibility': "never_show"},
         },
     },
@@ -583,6 +731,29 @@ FORMATTER_OVERRIDES = {
                 },
         },
     },
+    # Not a Node: dumped through the pseudo-node path.  sub_states is a List
+    # of plain reduce_outer_joins_pass1_state structs, which format_node_list
+    # can only report as "<unknown NodeTag 130867672 at 0x...>".
+    'reduce_outer_joins_pass1_state': {
+        'fields': {
+            'sub_states': {'formatter': 'format_pseudo_node_list_field'},
+        },
+    },
+    'reduce_outer_joins_pass2_state': {
+        'fields': {
+            'partial_reduced': {'formatter': 'format_pseudo_node_list_field'},
+        },
+    },
+}
+
+# Lists whose cells point at plain C structs rather than at Nodes.  A List
+# stores bare (void *) cells, so the element type is only knowable from the
+# field holding the list -- keyed here by (owning struct, field name).
+PSEUDO_NODE_LIST_ELEMENTS = {
+    ('reduce_outer_joins_pass1_state', 'sub_states'):
+        'reduce_outer_joins_pass1_state',
+    ('reduce_outer_joins_pass2_state', 'partial_reduced'):
+        'reduce_outer_joins_partial_state',
 }
 
 
@@ -818,29 +989,758 @@ def format_char(value):
     return str_val.split(' ')[1][1:-1]
 
 
+def bitmapword_bits(bitmapset):
+    '''number of bits in one bitmapword of 'bitmapset' (32 or 64)'''
+    try:
+        return int(bitmapset['words'][0].type.sizeof) * 8
+    except Exception:
+        return 32
+
+
+def bitmapset_words(bitmapset):
+    '''yield every word of 'bitmapset' as a plain (unsigned) Python int'''
+    num_words = int(bitmapset['nwords'])
+    bits = bitmapword_bits(bitmapset)
+    mask = (1 << bits) - 1
+
+    for i in range(num_words):
+        yield int(bitmapset['words'][i]) & mask
+
+
+def bitmapset_members(bitmapset):
+    '''the bit numbers set in 'bitmapset' (what bms_next_member() would return)'''
+    members = []
+    bits = bitmapword_bits(bitmapset)
+
+    for i, word in enumerate(bitmapset_words(bitmapset)):
+        bit = 0
+        while word != 0:
+            if word & 1:
+                members.append(i * bits + bit)
+            word >>= 1
+            bit += 1
+
+    return members
+
+
 def format_bitmapset(bitmapset):
+    '''dump a Bitmapset as the values of its words[] array, plus the members
+
+    Printing the words concatenated into a single '0x...' string (what this
+    used to do) reads like a pointer -- 'relids=0x00000006' looks like an
+    address, not like "words[0] is 6".  Print one value per word instead,
+    and spell out the bits they stand for.
+    '''
     if (str(bitmapset) == '0x0'):
         return '0x0'
 
-    num_words = int(bitmapset['nwords'])
-    retval = '0x'
-    for word in reversed(range(num_words)):
-        retval += '%08x' % int(bitmapset['words'][word])
-    return retval
+    digits = bitmapword_bits(bitmapset) // 4
+    words = ['0x%0*x' % (digits, word) for word in bitmapset_words(bitmapset)]
+    members = bitmapset_members(bitmapset)
+
+    return '[%s] (%s)' % (', '.join(words),
+                          ' '.join([str(m) for m in members]))
 
 
 # ---
-# PartitionBoundInfoData related dumpers
+# Datum decoding
 #
-# PartitionBoundInfoData is not a Node, and its datums / kind / indexes
-# members are bare pointers whose lengths live in the sibling fields
-# (ndatums, strategy, nindexes).  They can therefore only be dumped with
-# the whole boundinfo at hand.
+# A Datum is 8 opaque bytes; what they mean is only known from the type of
+# the column they belong to.  Partition bounds (boundinfo->datums), Const
+# nodes and the like therefore need the type OID -- or at least typlen and
+# typbyval -- to be shown as anything better than a number.  Byte order is
+# taken to be little-endian, which is what every platform we debug on uses.
+
+PG_EPOCH_DATE = datetime.date(2000, 1, 1)
+PG_EPOCH_TIMESTAMP = datetime.datetime(2000, 1, 1)
+INT32_MIN = -(1 << 31)
+INT32_MAX = (1 << 31) - 1
+INT64_MIN = -(1 << 63)
+INT64_MAX = (1 << 63) - 1
+NAMEDATALEN = 64
+
+def datum_bits():
+    '''sizeof(Datum) in bits (64 everywhere we run, but ask gdb)'''
+    try:
+        return int(gdb.lookup_type('Datum').sizeof) * 8
+    except gdb.error:
+        return 64
+
+def datum_unsigned(datum):
+    '''the raw bits of 'datum' as a non-negative Python int'''
+    return int(datum) & ((1 << datum_bits()) - 1)
+
+def sign_extend(value, bits):
+    value &= (1 << bits) - 1
+    if value & (1 << (bits - 1)):
+        value -= (1 << bits)
+    return value
+
+def is_null_pointer(value):
+    try:
+        return (value.type.strip_typedefs().code == gdb.TYPE_CODE_PTR and
+                int(value) == 0)
+    except Exception:
+        return False
+
+def value_address_string(value):
+    '''"0x..." for a pointer, or for the address of a struct value'''
+    try:
+        if value.type.strip_typedefs().code == gdb.TYPE_CODE_STRUCT:
+            return str(value.address)
+    except Exception:
+        pass
+    return str(value)
+
+def read_inferior_memory(addr, length):
+    return bytes(gdb.selected_inferior().read_memory(int(addr), length))
+
+def read_varlena(addr):
+    '''payload bytes of the (detoasted) varlena at 'addr'
+
+    Raises ValueError for toasted or compressed values; those never occur in
+    catalog-derived partition bounds or in Consts.
+    '''
+    addr = int(addr)
+    first = read_inferior_memory(addr, 1)[0]
+    if first & 0x01 == 0x01:
+        if first == 0x01:
+            raise ValueError('external (toasted) varlena')
+        # 1-byte header, the length includes the header byte itself
+        length = (first >> 1) & 0x7F
+        return read_inferior_memory(addr + 1, length - 1)
+    if first & 0x03 == 0x02:
+        raise ValueError('compressed varlena')
+    # 4-byte header, the length includes the 4 header bytes
+    word = struct.unpack('<I', read_inferior_memory(addr, 4))[0]
+    length = (word >> 2) & 0x3FFFFFFF
+    return read_inferior_memory(addr + 4, length - 4)
+
+def read_cstring(addr, max_length=NAMEDATALEN):
+    data = read_inferior_memory(addr, max_length)
+    end = data.find(b'\0')
+    if end >= 0:
+        data = data[:end]
+    return data
+
+def quote_bytes(data):
+    '''double-quoted rendering of 'data', escaping what isn't printable'''
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        text = data.decode('latin-1')
+
+    retval = '"'
+    for ch in text:
+        if ch in ('"', '\\'):
+            retval += '\\' + ch
+        elif ch.isprintable():
+            retval += ch
+        else:
+            retval += '\\x%02x' % ord(ch)
+    return retval + '"'
+
+def format_time_of_day(usecs):
+    secs, frac = divmod(usecs, 1000000)
+    hours, rem = divmod(secs, 3600)
+    minutes, seconds = divmod(rem, 60)
+    text = '%02d:%02d:%02d' % (hours, minutes, seconds)
+    if frac:
+        text += ('.%06d' % frac).rstrip('0')
+    return text
+
+def format_datum_int(datum, bits):
+    return str(sign_extend(datum_unsigned(datum), bits))
+
+def format_datum_int2(datum, typmod=None):
+    return format_datum_int(datum, 16)
+
+def format_datum_int4(datum, typmod=None):
+    return format_datum_int(datum, 32)
+
+def format_datum_int8(datum, typmod=None):
+    return format_datum_int(datum, 64)
+
+def format_datum_oid(datum, typmod=None):
+    return str(datum_unsigned(datum) & 0xFFFFFFFF)
+
+def format_datum_xid8(datum, typmod=None):
+    return str(datum_unsigned(datum))
+
+def format_datum_bool(datum, typmod=None):
+    if datum_unsigned(datum) & 0xFF:
+        return 'true'
+    return 'false'
+
+def format_datum_char(datum, typmod=None):
+    return quote_bytes(bytes([datum_unsigned(datum) & 0xFF]))
+
+def format_datum_float4(datum, typmod=None):
+    raw = struct.pack('<I', datum_unsigned(datum) & 0xFFFFFFFF)
+    return repr(struct.unpack('<f', raw)[0])
+
+def format_datum_float8(datum, typmod=None):
+    raw = struct.pack('<Q', datum_unsigned(datum))
+    return repr(struct.unpack('<d', raw)[0])
+
+def format_datum_money(datum, typmod=None):
+    cents = sign_extend(datum_unsigned(datum), 64)
+    sign = '-' if cents < 0 else ''
+    return '%s%d.%02d' % (sign, abs(cents) // 100, abs(cents) % 100)
+
+def format_datum_date(datum, typmod=None):
+    days = sign_extend(datum_unsigned(datum), 32)
+    if days == INT32_MIN:
+        return '-infinity'
+    if days == INT32_MAX:
+        return 'infinity'
+    try:
+        return (PG_EPOCH_DATE + datetime.timedelta(days=days)).isoformat()
+    except OverflowError:
+        return '<%d days from 2000-01-01>' % days
+
+def format_datum_time(datum, typmod=None):
+    return format_time_of_day(sign_extend(datum_unsigned(datum), 64))
+
+def format_datum_timestamp(datum, typmod=None, with_tz=False):
+    usecs = sign_extend(datum_unsigned(datum), 64)
+    if usecs == INT64_MIN:
+        return '-infinity'
+    if usecs == INT64_MAX:
+        return 'infinity'
+    try:
+        value = PG_EPOCH_TIMESTAMP + datetime.timedelta(microseconds=usecs)
+    except OverflowError:
+        return '<%d usecs from 2000-01-01>' % usecs
+
+    text = value.isoformat(sep=' ')
+    if with_tz:
+        # timestamptz is stored in UTC
+        text += '+00'
+    return text
+
+def format_datum_timestamptz(datum, typmod=None):
+    return format_datum_timestamp(datum, typmod, with_tz=True)
+
+def format_datum_timetz(datum, typmod=None):
+    time, zone = struct.unpack('<qi', read_inferior_memory(datum_unsigned(datum), 12))
+    # zone is seconds west of UTC
+    sign = '-' if zone > 0 else '+'
+    return '%s%s%02d:%02d' % (format_time_of_day(time), sign,
+                              abs(zone) // 3600, (abs(zone) % 3600) // 60)
+
+def format_datum_interval(datum, typmod=None):
+    time, day, month = struct.unpack('<qii', read_inferior_memory(datum_unsigned(datum), 16))
+
+    parts = []
+    if month != 0:
+        sign = '-' if month < 0 else ''
+        years, months = divmod(abs(month), 12)
+        if years:
+            parts.append('%s%d year%s' % (sign, years, '' if years == 1 else 's'))
+        if months:
+            parts.append('%s%d mon%s' % (sign, months, '' if months == 1 else 's'))
+    if day != 0:
+        parts.append('%d day%s' % (day, '' if abs(day) == 1 else 's'))
+    if time != 0 or len(parts) == 0:
+        sign = '-' if time < 0 else ''
+        parts.append(sign + format_time_of_day(abs(time)))
+    return ' '.join(parts)
+
+def format_datum_text(datum, typmod=None):
+    return quote_bytes(read_varlena(datum_unsigned(datum)))
+
+def format_datum_bytea(datum, typmod=None):
+    return '\\x' + read_varlena(datum_unsigned(datum)).hex()
+
+def format_datum_jsonb(datum, typmod=None):
+    return '<jsonb, %d bytes>' % len(read_varlena(datum_unsigned(datum)))
+
+def format_datum_name(datum, typmod=None):
+    return quote_bytes(read_cstring(datum_unsigned(datum), NAMEDATALEN))
+
+def format_datum_cstring(datum, typmod=None):
+    return quote_bytes(read_cstring(datum_unsigned(datum), 4096))
+
+def format_datum_uuid(datum, typmod=None):
+    data = read_inferior_memory(datum_unsigned(datum), 16).hex()
+    return '%s-%s-%s-%s-%s' % (data[0:8], data[8:12], data[12:16],
+                               data[16:20], data[20:32])
+
+def format_numeric_bytes(data):
+    '''decode the payload of a numeric varlena (base-10000 digits, the
+    default NBASE)'''
+    header = struct.unpack('<H', data[0:2])[0]
+    flagbits = header & 0xC000
+
+    if flagbits == 0xC000:
+        # NaN / +Inf / -Inf (the infinities exist since PG14)
+        special = {0xC000: 'NaN', 0xD000: 'Infinity', 0xF000: '-Infinity'}
+        return special.get(header & 0xF000, '<numeric special 0x%04x>' % header)
+
+    if flagbits == 0x8000:
+        # short format: sign, dscale and weight all in one 16-bit header
+        negative = (header & 0x2000) != 0
+        dscale = (header & 0x1F80) >> 7
+        weight = header & 0x003F
+        if header & 0x0040:
+            weight |= ~0x003F
+        digits_offset = 2
+    else:
+        negative = (flagbits == 0x4000)
+        dscale = header & 0x3FFF
+        weight = struct.unpack('<h', data[2:4])[0]
+        digits_offset = 4
+
+    ndigits = (len(data) - digits_offset) // 2
+    digits = struct.unpack('<%dh' % ndigits,
+                           data[digits_offset:digits_offset + 2 * ndigits])
+
+    def digit(i):
+        if 0 <= i < ndigits:
+            return digits[i]
+        return 0
+
+    if weight < 0 or ndigits == 0:
+        integer = '0'
+    else:
+        integer = str(digit(0)) + ''.join(['%04d' % digit(i) for i in range(1, weight + 1)])
+
+    fraction = ''
+    if dscale > 0:
+        chunks = []
+        i = weight + 1
+        while len(chunks) * 4 < dscale:
+            chunks.append('%04d' % digit(i))
+            i += 1
+        fraction = '.' + ''.join(chunks)[:dscale]
+
+    return ('-' if negative else '') + integer + fraction
+
+def format_datum_numeric(datum, typmod=None):
+    return format_numeric_bytes(read_varlena(datum_unsigned(datum)))
+
+# type OID -> (type name, decoder).  Only built-in types can be known
+# here; everything else falls back to typlen/typbyval or the raw bits.
+TYPED_DATUM_FORMATTERS = {
+    16:   ('bool',        format_datum_bool),
+    17:   ('bytea',       format_datum_bytea),
+    18:   ('char',        format_datum_char),
+    19:   ('name',        format_datum_name),
+    20:   ('int8',        format_datum_int8),
+    21:   ('int2',        format_datum_int2),
+    23:   ('int4',        format_datum_int4),
+    24:   ('regproc',     format_datum_oid),
+    25:   ('text',        format_datum_text),
+    26:   ('oid',         format_datum_oid),
+    28:   ('xid',         format_datum_oid),
+    29:   ('cid',         format_datum_oid),
+    114:  ('json',        format_datum_text),
+    142:  ('xml',         format_datum_text),
+    700:  ('float4',      format_datum_float4),
+    701:  ('float8',      format_datum_float8),
+    790:  ('money',       format_datum_money),
+    1042: ('bpchar',      format_datum_text),
+    1043: ('varchar',     format_datum_text),
+    1082: ('date',        format_datum_date),
+    1083: ('time',        format_datum_time),
+    1114: ('timestamp',   format_datum_timestamp),
+    1184: ('timestamptz', format_datum_timestamptz),
+    1186: ('interval',    format_datum_interval),
+    1266: ('timetz',      format_datum_timetz),
+    1700: ('numeric',     format_datum_numeric),
+    2205: ('regclass',    format_datum_oid),
+    2206: ('regtype',     format_datum_oid),
+    2275: ('cstring',     format_datum_cstring),
+    2950: ('uuid',        format_datum_uuid),
+    3802: ('jsonb',       format_datum_jsonb),
+    5069: ('xid8',        format_datum_xid8),
+}
+
+def type_name_string(typid):
+    '''name of the built-in type 'typid', None if it isn't one we know'''
+    entry = TYPED_DATUM_FORMATTERS.get(typid)
+    if entry == None:
+        return None
+    return entry[0]
+
+def format_typid(typid):
+    name = type_name_string(typid)
+    if name == None:
+        return str(typid)
+    return '%d (%s)' % (typid, name)
+
+def format_datum_raw(datum):
+    '''a Datum without type information: small values are almost certainly
+    by-value integers, big ones pointers of by-reference types'''
+    value = int(datum)
+    if 0 <= value < 65536:
+        return str(value)
+    return '0x%x' % datum_unsigned(datum)
+
+def format_typed_datum(datum, typid=None, typlen=None, typbyval=None, typmod=None):
+    '''render 'datum' with whatever type information is at hand
+
+    Each level of knowledge is a fallback for the one above: a known type OID
+    decodes fully, typlen/typbyval at least tell an integer from a string, and
+    with nothing at all the raw bits are shown.
+    '''
+    try:
+        if typid != None:
+            entry = TYPED_DATUM_FORMATTERS.get(int(typid))
+            if entry != None:
+                return entry[1](datum, typmod)
+
+        if typbyval != None:
+            if typbyval:
+                if typlen in (1, 2, 4, 8):
+                    return str(sign_extend(datum_unsigned(datum), typlen * 8))
+            elif typlen == -1:
+                return quote_bytes(read_varlena(datum_unsigned(datum)))
+            elif typlen == -2:
+                return format_datum_cstring(datum)
+            elif typlen != None and typlen > 0:
+                return '\\x' + read_inferior_memory(datum_unsigned(datum), typlen).hex()
+    except Exception as e:
+        return '<%s: %s> %s' % (type(e).__name__, e, format_datum_raw(datum))
+
+    return format_datum_raw(datum)
+
+def format_const_value_field(node, field):
+    '''Const.constvalue decoded by consttype (or by constlen/constbyval)'''
+    if int(node['constisnull']) != 0:
+        return 'NULL'
+
+    typid = int(node['consttype'])
+    text = format_typed_datum(node[field], typid, int(node['constlen']),
+                              bool(int(node['constbyval'])),
+                              int(node['consttypmod']))
+    name = type_name_string(typid)
+    if name != None:
+        text += ' (%s)' % name
+    return text
+
+
+# ---
+# Partitioning related dumpers
+#
+# PartitionBoundInfoData, PartitionKeyData, PartitionDescData and
+# PartitionDirectoryData are not Nodes, and most of their members are bare
+# pointers whose lengths live in sibling fields (ndatums, partnatts, nparts)
+# -- or, for boundinfo->datums, in a completely different struct: the row
+# width and the column types of the bounds come from the PartitionKey.
+# The key that applies is therefore tracked while a dump is in progress
+# (partition_key_stack): pushed by the formatters of the structs that carry
+# one (Relation.rd_partkey, PartitionDispatchData.key, RelOptInfo.part_scheme)
+# and by 'pgprint <expr> <partkey>' on the command line.
+
+def partition_strategy_char(value):
+    '''strategy as 'h' / 'l' / 'r', whether it is a plain char (PG <= 17) or
+    a PartitionStrategy enum (PG18+)'''
+    try:
+        return chr(int(value) & 0xFF)
+    except Exception:
+        return str(value)
+
+PARTITION_STRATEGY_NAMES = {'h': 'HASH', 'l': 'LIST', 'r': 'RANGE'}
+
+def format_partition_strategy_field(node, field):
+    value = node[field]
+    # PartitionSpec.strategy is a 'char *' ("range") before PG18
+    if value.type.strip_typedefs().code == gdb.TYPE_CODE_PTR:
+        return getchars(value)
+    return "'%s'" % partition_strategy_char(value)
+
+def partition_range_datum_kind(kind):
+    '''-1 / 0 / 1 for PARTITION_RANGE_DATUM_{MINVALUE,VALUE,MAXVALUE}'''
+    try:
+        return int(kind)
+    except Exception:
+        text = str(kind)
+        if 'MINVALUE' in text:
+            return -1
+        if 'MAXVALUE' in text:
+            return 1
+        return 0
+
+def read_array(array, length, convert=int):
+    '''the first 'length' elements of the C array 'array' as a Python list,
+    None when the pointer is NULL or the length unknown'''
+    if length == None or is_null_pointer(array):
+        return None
+    return [convert(array_element(array, i)) for i in range(length)]
+
+def array_element(array, i):
+    '''array[i] for a pointer as well as for a C array -- including the
+    zero-length FLEXIBLE_ARRAY_MEMBER kind, which gdb won't index'''
+    if array.type.strip_typedefs().code == gdb.TYPE_CODE_ARRAY:
+        return (array[0].address + i).dereference()
+    return array[i]
+
+def namedata_string(value):
+    try:
+        return getchars(value['data'])
+    except gdb.error:
+        return getchars(value)
+
+def format_fmgr_info(fmgr):
+    '''"btint4cmp (fn_oid=351)" for an FmgrInfo'''
+    text = str(fmgr['fn_addr'])            # "(PGFunction) 0x... <btint4cmp>"
+    m = re.search(r'<([^>]+)>', text)
+    name = m.group(1) if m != None else text
+    return '%s (fn_oid=%d)' % (name, int(fmgr['fn_oid']))
+
+def format_relation_brief(rel):
+    '''one line for a Relation: its OID, name and relkind'''
+    if is_null_pointer(rel):
+        return '(NULL)'
+
+    parts = []
+    try:
+        parts.append('relid=%d' % int(rel['rd_id']))
+    except gdb.error:
+        pass
+    try:
+        form = rel['rd_rel']
+        if not is_null_pointer(form):
+            parts.append('relname=%s' % namedata_string(form['relname']))
+            parts.append("relkind='%s'" % chr(int(form['relkind']) & 0xFF))
+    except gdb.error:
+        pass
+
+    return '(Relation) %s [%s]' % (value_address_string(rel), ' '.join(parts))
+
+def format_relation_brief_field(node, field):
+    return format_relation_brief(node[field])
+
+
+class PartitionKeyInfo(object):
+    '''what pgprint needs to know about a partition key to decode the bounds
+
+    Built from whichever struct is at hand: a PartitionKeyData (relcache), a
+    PartitionSchemeData (planner; its partopcintype stands in for the column
+    types, which is exact for every built-in opclass), or one of the structs
+    carrying either of those.  A PartitionPruneContext only knows the
+    strategy and the number of key columns.
+    '''
+    def __init__(self, source, strategy=None, partnatts=None):
+        self.source = source            # e.g. "PartitionKeyData 0x..."
+        self.strategy = strategy        # 'h', 'l' or 'r'
+        self.partnatts = partnatts
+        self.typids = None              # per-column lists, None if unknown
+        self.typmods = None
+        self.typlens = None
+        self.typbyvals = None
+
+    def column_type(self, col):
+        '''(typid, typlen, typbyval, typmod) of key column 'col', each None
+        when unknown'''
+        def pick(values):
+            if values == None or col >= len(values):
+                return None
+            return values[col]
+        return (pick(self.typids), pick(self.typlens), pick(self.typbyvals),
+                pick(self.typmods))
+
+    def has_types(self):
+        return self.typids != None or self.typbyvals != None
+
+    def format_datum(self, datum, col):
+        typid, typlen, typbyval, typmod = self.column_type(col)
+        return format_typed_datum(datum, typid, typlen, typbyval, typmod)
+
+    def describe_types(self):
+        if self.partnatts == None:
+            return '<unknown>'
+        names = []
+        for col in range(self.partnatts):
+            typid, typlen, typbyval, typmod = self.column_type(col)
+            if typid != None:
+                names.append(type_name_string(typid) or str(typid))
+            elif typbyval != None:
+                names.append('typlen=%s%s' % (typlen, ' byval' if typbyval else ''))
+            else:
+                names.append('?')
+        return '[%s]' % ', '.join(names)
+
+def key_info_from_partkey(key):
+    partnatts = int(key['partnatts'])
+    info = PartitionKeyInfo('PartitionKeyData %s' % value_address_string(key),
+                            partition_strategy_char(key['strategy']), partnatts)
+    info.typids = read_array(key['parttypid'], partnatts)
+    info.typmods = read_array(key['parttypmod'], partnatts)
+    info.typlens = read_array(key['parttyplen'], partnatts)
+    info.typbyvals = read_array(key['parttypbyval'], partnatts, lambda v: bool(int(v)))
+    return info
+
+def key_info_from_partscheme(scheme):
+    partnatts = int(scheme['partnatts'])
+    info = PartitionKeyInfo('PartitionSchemeData %s' % value_address_string(scheme),
+                            partition_strategy_char(scheme['strategy']), partnatts)
+    info.typids = read_array(scheme['partopcintype'], partnatts)
+    info.typlens = read_array(scheme['parttyplen'], partnatts)
+    info.typbyvals = read_array(scheme['parttypbyval'], partnatts, lambda v: bool(int(v)))
+    return info
+
+def key_info_from_prune_context(context):
+    return PartitionKeyInfo('PartitionPruneContext %s' % value_address_string(context),
+                            partition_strategy_char(context['strategy']),
+                            int(context['partnatts']))
+
+# structs that hold a partition key (or something holding one) in a member
+PARTITION_KEY_CARRIERS = {
+    'RelationData': 'rd_partkey',
+    'PartitionDispatchData': 'key',
+    'RelOptInfo': 'part_scheme',
+    'PartitionDirectoryEntry': 'rel',
+}
+
+def partition_key_info(value):
+    '''PartitionKeyInfo describing the partition key 'value' holds or points
+    at, None when it holds none'''
+    if value == None or is_null_pointer(value):
+        return None
+    try:
+        type_name = get_base_datatype_string(value).replace('struct ', '')
+    except Exception:
+        return None
+
+    if type_name == 'PartitionKeyData':
+        return key_info_from_partkey(value)
+    if type_name == 'PartitionSchemeData':
+        return key_info_from_partscheme(value)
+    if type_name == 'PartitionPruneContext':
+        return key_info_from_prune_context(value)
+
+    carrier = PARTITION_KEY_CARRIERS.get(type_name)
+    if carrier != None:
+        return partition_key_info(value[carrier])
+    return None
+
+# the PartitionKeyInfo in effect while dumping (innermost last)
+partition_key_stack = []
+
+def current_partition_key():
+    if len(partition_key_stack) == 0:
+        return None
+    return partition_key_stack[-1]
+
+def format_with_partition_key(key, func, *args, **kwargs):
+    '''call func(*args, **kwargs) with 'key' as the partition key in effect'''
+    if key == None:
+        return func(*args, **kwargs)
+
+    partition_key_stack.append(key)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        partition_key_stack.pop()
+
+def format_partition_field_with_key(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
+    '''dump node[field] -- a PartitionDesc or PartitionBoundInfo -- decoding
+    the bound datums with the partition key that 'node' itself carries
+    (rel->rd_partkey, dispatch->key, rel->part_scheme, entry->rel->...)'''
+    try:
+        key = partition_key_info(node)
+    except Exception:
+        key = None
+    return format_with_partition_key(key, format_pseudo_node_field, node, field,
+                                     cast_to, skip_tag, print_null, indent)
+
+
+# ---
+# arrays whose length sits in a sibling field: (struct, field) -> (length,
+# element kind).  The length is a member name, or a '->' path from the struct.
+SIZED_ARRAY_FIELDS = {
+    ('PartitionKeyData', 'partattrs'):       ('partnatts', 'int'),
+    ('PartitionKeyData', 'partopfamily'):    ('partnatts', 'oid'),
+    ('PartitionKeyData', 'partopcintype'):   ('partnatts', 'typid'),
+    ('PartitionKeyData', 'partsupfunc'):     ('partnatts', 'fmgr'),
+    ('PartitionKeyData', 'partcollation'):   ('partnatts', 'oid'),
+    ('PartitionKeyData', 'parttypid'):       ('partnatts', 'typid'),
+    ('PartitionKeyData', 'parttypmod'):      ('partnatts', 'int'),
+    ('PartitionKeyData', 'parttyplen'):      ('partnatts', 'int'),
+    ('PartitionKeyData', 'parttypbyval'):    ('partnatts', 'bool'),
+    ('PartitionKeyData', 'parttypalign'):    ('partnatts', 'char'),
+    ('PartitionKeyData', 'parttypcoll'):     ('partnatts', 'oid'),
+    ('PartitionSchemeData', 'partopfamily'):  ('partnatts', 'oid'),
+    ('PartitionSchemeData', 'partopcintype'): ('partnatts', 'typid'),
+    ('PartitionSchemeData', 'partcollation'): ('partnatts', 'oid'),
+    ('PartitionSchemeData', 'parttyplen'):    ('partnatts', 'int'),
+    ('PartitionSchemeData', 'parttypbyval'):  ('partnatts', 'bool'),
+    ('PartitionSchemeData', 'partsupfunc'):   ('partnatts', 'fmgr'),
+    ('PartitionDescData', 'oids'):           ('nparts', 'oid'),
+    ('PartitionDescData', 'is_leaf'):        ('nparts', 'bool'),
+    ('PartitionPruneContext', 'partcollation'): ('partnatts', 'oid'),
+    ('PartitionPruneContext', 'partsupfunc'):   ('partnatts', 'fmgr'),
+    ('PartitionDispatchData', 'indexes'):    ('partdesc->nparts', 'int'),
+}
+
+ARRAY_ELEMENTS_PER_LINE = {'fmgr': 4}
+MAX_ARRAY_ELEMENTS = 512
+
+def format_array_element(value, kind):
+    if kind == 'bool':
+        return 'true' if int(value) else 'false'
+    if kind == 'char':
+        return "'%s'" % chr(int(value) & 0xFF)
+    if kind == 'typid':
+        return format_typid(int(value))
+    if kind == 'fmgr':
+        return format_fmgr_info(value)
+    if kind == 'oid':
+        return str(int(value) & 0xFFFFFFFF)
+    return str(int(value))
+
+def format_array_values(array, length, kind):
+    '''"[a, b, c]", split over several lines when long'''
+    shown = min(length, MAX_ARRAY_ELEMENTS)
+    values = [format_array_element(array_element(array, i), kind) for i in range(shown)]
+    if length > shown:
+        values.append('... %d more' % (length - shown))
+
+    per_line = ARRAY_ELEMENTS_PER_LINE.get(kind, 16)
+    if len(values) <= per_line:
+        return '[%s]' % ', '.join(values)
+
+    lines = []
+    for i in range(0, len(values), per_line):
+        chunk = values[i:i + per_line]
+        lines.append('[%d..%d] %s' % (i, i + len(chunk) - 1, ', '.join(chunk)))
+    return add_indent('\n'.join(lines), 1, True)
+
+def array_length_from(node, spec):
+    value = node
+    for step in spec.split('->'):
+        value = value[step]
+    return int(value)
+
+def format_sized_array_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
+    array = node[field]
+    if is_null_pointer(array):
+        if print_null:
+            return add_indent('[%s] (NULL)' % field, indent, True)
+        return ''
+
+    type_name = get_base_datatype_string(node).replace('struct ', '')
+    spec = SIZED_ARRAY_FIELDS.get((type_name, field))
+    if spec == None:
+        return add_indent('[%s] %s' % (field, array), indent, True)
+
+    length_spec, kind = spec
+    length = array_length_from(node, length_spec)
+    return add_indent('[%s] (%s=%d) %s' % (field, length_spec, length,
+                                           format_array_values(array, length, kind)),
+                      indent, True)
+
+
+# ---
+# PartitionBoundInfoData
 
 def partition_bound_strategy(boundinfo):
-    return format_char(boundinfo['strategy'])
+    return partition_strategy_char(boundinfo['strategy'])
 
-def partition_bound_natts(boundinfo, natts=None):
+def partition_bound_natts(boundinfo, natts=None, key=None):
     '''number of Datums in each datums[i] row, None if it cannot be derived
 
     hash: (modulus, remainder); list: 1 value per row.  For range
@@ -855,6 +1755,8 @@ def partition_bound_natts(boundinfo, natts=None):
         return 2
     if strategy == 'l':
         return 1
+    if key != None:
+        return key.partnatts
     return None
 
 def partition_bound_nindexes(boundinfo):
@@ -872,80 +1774,103 @@ def partition_bound_nindexes(boundinfo):
         return ndatums + 1
     if strategy == 'h':
         # greatest modulus == modulus of the last (modulus, remainder) row
-        if ndatums > 0 and str(boundinfo['datums'][ndatums - 1]) != '0x0':
+        if ndatums > 0 and not is_null_pointer(boundinfo['datums'][ndatums - 1]):
             return int(boundinfo['datums'][ndatums - 1][0])
     return None
 
-def format_datum_raw(datum):
-    '''a Datum without type information: small values are almost certainly
-    by-value integers, big ones pointers of by-reference types'''
-    value = int(datum)
-    if 0 <= value < 65536:
-        return str(value)
-    return '0x%x' % (value & ((1 << 64) - 1))
+def partition_bound_kind(boundinfo):
+    '''boundinfo->kind, None when NULL (hash / list) or absent'''
+    try:
+        kind = boundinfo['kind']
+    except gdb.error:
+        return None
+    if is_null_pointer(kind):
+        return None
+    return kind
 
-def format_partition_datum(datum, kind=None):
+def format_partition_bound_datum(datum, kind, strategy, key, col):
+    '''one bound Datum: MINVALUE / MAXVALUE, a hash (modulus, remainder)
+    int, or the value decoded with the key column's type'''
     if kind != None:
-        kind_string = str(kind)
-        if 'MINUS_INFINITY' in kind_string or kind_string == '-1':
-            return 'MINUS_INFINITY'
-        if 'MAXVALUE' in kind_string or kind_string == '1':
+        which = partition_range_datum_kind(kind)
+        if which < 0:
+            return 'MINVALUE'
+        if which > 0:
             return 'MAXVALUE'
+
+    if strategy == 'h':
+        return format_datum_int(datum, 32)
+    if key != None:
+        return key.format_datum(datum, col)
     return format_datum_raw(datum)
+
+def format_partition_bound_row(boundinfo, i, row_natts, strategy, key):
+    '''"(v1, v2, ...)" for boundinfo->datums[i]'''
+    row = boundinfo['datums'][i]
+    if is_null_pointer(row):
+        return '(NULL)'
+
+    kind = partition_bound_kind(boundinfo)
+    values = []
+    for col in range(row_natts):
+        col_kind = None
+        if kind != None and not is_null_pointer(kind[i]):
+            col_kind = kind[i][col]
+        values.append(format_partition_bound_datum(row[col], col_kind, strategy, key, col))
+    return '(%s)' % ', '.join(values)
+
+RANGE_NATTS_HINT = ("<range bounds: partnatts is not stored in the boundinfo,"
+                    " showing 1 Datum per row; use 'pgprint <expr> <natts>' or"
+                    " 'pgprint <expr> <partkey>' (e.g. rel->rd_partkey, rel, pd)"
+                    " for the real row width>")
+RAW_DATUMS_HINT = ("<Datums shown raw: pass the partition key to decode them,"
+                   " e.g. 'pgprint <expr> rel->rd_partkey'>")
 
 def format_partition_datums(boundinfo, natts=None, indent=0):
     datums = boundinfo['datums']
-    if str(datums) == '0x0':
+    if is_null_pointer(datums):
         return add_indent('(NULL)', indent)
 
     ndatums = int(boundinfo['ndatums'])
     strategy = partition_bound_strategy(boundinfo)
-    row_natts = partition_bound_natts(boundinfo, natts)
+    key = current_partition_key()
+    row_natts = partition_bound_natts(boundinfo, natts, key)
 
-    kind = None
-    try:
-        if str(boundinfo['kind']) != '0x0':
-            kind = boundinfo['kind']
-    except gdb.error:
-        pass
+    header = "(strategy='%s' ndatums=%d" % (strategy, ndatums)
+    if strategy == 'h':
+        header += ' rows=(modulus, remainder))'
+    elif key != None and key.has_types():
+        header += ' natts=%s types=%s from %s)' % (row_natts, key.describe_types(), key.source)
+    else:
+        header += ' natts=%s)' % row_natts
 
-    lines = ["(strategy='%s' ndatums=%d)" % (strategy, ndatums)]
+    lines = [header]
     if row_natts == None:
-        lines.append(INDENT_STRING + "<range bounds: partnatts is not stored"
-                     " in the boundinfo, showing 1 Datum per row;"
-                     " use 'pgprint <expr> <natts>' for multi-column keys>")
+        lines.append(INDENT_STRING + RANGE_NATTS_HINT)
         row_natts = 1
+    if strategy != 'h' and (key == None or not key.has_types()):
+        lines.append(INDENT_STRING + RAW_DATUMS_HINT)
 
     for i in range(ndatums):
-        row = datums[i]
-        if str(row) == '0x0':
-            lines.append(INDENT_STRING + '[%d] (NULL)' % i)
-            continue
-
-        values = []
-        for col in range(row_natts):
-            col_kind = None
-            if kind != None and str(kind[i]) != '0x0':
-                col_kind = kind[i][col]
-            values.append(format_partition_datum(row[col], col_kind))
-        lines.append(INDENT_STRING + '[%d] (%s)' % (i, ', '.join(values)))
+        lines.append(INDENT_STRING + '[%d] %s' % (
+            i, format_partition_bound_row(boundinfo, i, row_natts, strategy, key)))
 
     return add_indent('\n'.join(lines), indent)
 
 def format_partition_kind(boundinfo, natts=None, indent=0):
     kind = boundinfo['kind']
-    if str(kind) == '0x0':
+    if is_null_pointer(kind):
         return add_indent('(NULL)', indent)
 
     ndatums = int(boundinfo['ndatums'])
-    row_natts = partition_bound_natts(boundinfo, natts)
+    row_natts = partition_bound_natts(boundinfo, natts, current_partition_key())
     if row_natts == None:
         row_natts = 1
 
     lines = ['(ndatums=%d)' % ndatums]
     for i in range(ndatums):
         row = kind[i]
-        if str(row) == '0x0':
+        if is_null_pointer(row):
             lines.append(INDENT_STRING + '[%d] (NULL)' % i)
             continue
         values = [str(row[col]) for col in range(row_natts)]
@@ -955,15 +1880,14 @@ def format_partition_kind(boundinfo, natts=None, indent=0):
 
 def format_partition_indexes(boundinfo, indent=0):
     indexes = boundinfo['indexes']
-    if str(indexes) == '0x0':
+    if is_null_pointer(indexes):
         return add_indent('(NULL)', indent)
 
     nindexes = partition_bound_nindexes(boundinfo)
     if nindexes == None:
         return add_indent('<cannot determine the length of indexes[]>', indent)
 
-    values = [str(int(indexes[i])) for i in range(nindexes)]
-    return add_indent('(nindexes=%d) [%s]' % (nindexes, ', '.join(values)),
+    return add_indent('(nindexes=%d) %s' % (nindexes, format_array_values(indexes, nindexes, 'int')),
                       indent)
 
 PARTITION_BOUND_MEMBERS = ('datums', 'kind', 'indexes')
@@ -999,7 +1923,7 @@ def print_partition_bound_member(expr, natts=None):
     return True
 
 def format_partition_datums_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
-    if str(node[field]) == '0x0':
+    if is_null_pointer(node[field]):
         if print_null:
             return add_indent('[%s] (NULL)' % field, indent, True)
         return ''
@@ -1007,7 +1931,7 @@ def format_partition_datums_field(node, field, cast_to=None, skip_tag=False, pri
                       indent, True)
 
 def format_partition_kind_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
-    if str(node[field]) == '0x0':
+    if is_null_pointer(node[field]):
         if print_null:
             return add_indent('[%s] (NULL)' % field, indent, True)
         return ''
@@ -1015,12 +1939,210 @@ def format_partition_kind_field(node, field, cast_to=None, skip_tag=False, print
                       indent, True)
 
 def format_partition_indexes_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
-    if str(node[field]) == '0x0':
+    if is_null_pointer(node[field]):
         if print_null:
             return add_indent('[%s] (NULL)' % field, indent, True)
         return ''
     return add_indent('[%s] %s' % (field, format_partition_indexes(node)),
                       indent, True)
+
+
+# ---
+# PartitionDescData: the per-partition summary
+
+def partition_bounds_by_index(boundinfo, natts=None):
+    '''{partition index: [bound clauses]} read off a PartitionBoundInfo,
+    spelled the way CREATE TABLE ... PARTITION OF ... FOR VALUES would'''
+    result = {}
+    if is_null_pointer(boundinfo):
+        return result
+
+    ndatums = int(boundinfo['ndatums'])
+    strategy = partition_bound_strategy(boundinfo)
+    key = current_partition_key()
+    row_natts = partition_bound_natts(boundinfo, natts, key)
+    if row_natts == None:
+        row_natts = 1
+    indexes = boundinfo['indexes']
+    datums = boundinfo['datums']
+
+    def row(i):
+        return format_partition_bound_row(boundinfo, i, row_natts, strategy, key)
+
+    if strategy == 'h':
+        # create_hash_bounds() renumbers the partitions into row order, so
+        # datums[i] describes partition i
+        for i in range(ndatums):
+            if is_null_pointer(datums[i]):
+                continue
+            result.setdefault(i, []).append(
+                'FOR VALUES WITH (MODULUS %d, REMAINDER %d)'
+                % (int(datums[i][0]), int(datums[i][1])))
+
+    elif strategy == 'l':
+        values = {}
+        for i in range(ndatums):
+            values.setdefault(int(indexes[i]), []).append(row(i)[1:-1])
+        null_index = int(boundinfo['null_index'])
+        if null_index >= 0:
+            values.setdefault(null_index, []).append('NULL')
+        for part, items in values.items():
+            result.setdefault(part, []).append('FOR VALUES IN (%s)' % ', '.join(items))
+
+    elif strategy == 'r':
+        # indexes[i] is the partition holding [datums[i-1], datums[i])
+        nindexes = partition_bound_nindexes(boundinfo)
+        if nindexes == None:
+            nindexes = ndatums + 1
+        for i in range(nindexes):
+            part = int(indexes[i])
+            if part < 0:
+                continue
+            lower = '(MINVALUE)' if i == 0 else row(i - 1)
+            upper = row(i) if i < ndatums else '(MAXVALUE)'
+            result.setdefault(part, []).append('FOR VALUES FROM %s TO %s' % (lower, upper))
+
+    default_index = int(boundinfo['default_index'])
+    if default_index >= 0:
+        result.setdefault(default_index, []).append('DEFAULT')
+
+    return result
+
+def format_partition_desc_summary(partdesc, indent=1):
+    '''[partitions]: every partition of a PartitionDesc with its OID, leaf
+    flag and the bounds the boundinfo assigns to it'''
+    nparts = int(partdesc['nparts'])
+    if nparts <= 0:
+        return ''
+
+    oids = partdesc['oids']
+    try:
+        is_leaf = partdesc['is_leaf']       # PG12+
+    except gdb.error:
+        is_leaf = None
+    bounds = partition_bounds_by_index(partdesc['boundinfo'])
+
+    lines = []
+    for part in range(min(nparts, MAX_ARRAY_ELEMENTS)):
+        text = '[%d] oid=%d' % (part, int(oids[part]) & 0xFFFFFFFF)
+        if is_leaf != None and not is_null_pointer(is_leaf):
+            text += ' leaf=%s' % ('true' if int(is_leaf[part]) else 'false')
+        text += ' ' + ' '.join(bounds.get(part, ['<no bound in boundinfo>']))
+        lines.append(text)
+    if nparts > MAX_ARRAY_ELEMENTS:
+        lines.append('... %d more' % (nparts - MAX_ARRAY_ELEMENTS))
+
+    return add_indent('[partitions]' + add_indent('\n'.join(lines), 1, True),
+                      indent, True)
+
+
+# ---
+# PartitionKeyData / PartitionSchemeData: the per-column summary
+
+# (member, label, element kind) -- members missing from the struct at hand
+# (PartitionSchemeData has no parttypid, ...) are skipped
+PARTITION_KEY_COLUMN_MEMBERS = (
+    ('partattrs',     'attnum',    'int'),
+    ('parttypid',     'type',      'typid'),
+    ('partopcintype', 'opcintype', 'typid'),
+    ('parttypmod',    'typmod',    'int'),
+    ('parttyplen',    'typlen',    'int'),
+    ('parttypbyval',  'byval',     'bool'),
+    ('parttypalign',  'align',     'char'),
+    ('parttypcoll',   'typcoll',   'oid'),
+    ('partcollation', 'collation', 'oid'),
+    ('partopfamily',  'opfamily',  'oid'),
+    ('partsupfunc',   'supfunc',   'fmgr'),
+)
+
+def format_partition_key_summary(key, indent=1):
+    '''[columns]: one line per partition key column gathering the parallel
+    per-column arrays of a PartitionKeyData or PartitionSchemeData'''
+    partnatts = int(key['partnatts'])
+    if partnatts <= 0:
+        return ''
+
+    lines = []
+    for col in range(partnatts):
+        parts = []
+        for member, label, kind in PARTITION_KEY_COLUMN_MEMBERS:
+            try:
+                array = key[member]
+            except gdb.error:
+                continue
+            if is_null_pointer(array):
+                continue
+            value = format_array_element(array_element(array, col), kind)
+            if member == 'partattrs' and int(array_element(array, col)) == 0:
+                value += ' (expression)'
+            parts.append('%s=%s' % (label, value))
+        lines.append('[%d] %s' % (col, ' '.join(parts)))
+
+    return add_indent('[columns]' + add_indent('\n'.join(lines), 1, True),
+                      indent, True)
+
+
+# ---
+# PartitionDirectoryData: walk the dynahash table of PartitionDirectoryEntry
+
+def hash_table_entries(htab, max_entries=100000):
+    '''yield a (char *) to every entry of the dynahash table 'htab', in the
+    order hash_seq_search() would visit them'''
+    hctl = htab['hctl']
+    max_bucket = int(hctl['max_bucket'])
+    try:
+        ssize = int(htab['ssize'])          # up to PG18
+        sshift = int(htab['sshift'])
+    except gdb.error:
+        ssize, sshift = 256, 8              # PG19+: HASH_SEGSIZE(_SHIFT)
+
+    # entries start at ELEMENTKEY(elem): MAXALIGN(sizeof(HASHELEMENT)) past
+    # the element header
+    elem_size = int(gdb.lookup_type('HASHELEMENT').sizeof)
+    key_offset = (elem_size + 7) & ~7
+    char_ptr = gdb.lookup_type('char').pointer()
+
+    count = 0
+    for bucket in range(max_bucket + 1):
+        segp = htab['dir'][bucket >> sshift]
+        if is_null_pointer(segp):
+            continue
+        elem = segp[bucket & (ssize - 1)]
+        while not is_null_pointer(elem):
+            yield elem.cast(char_ptr) + key_offset
+            count += 1
+            if count >= max_entries:
+                return
+            elem = elem['link']
+
+def format_partition_directory_hash_field(node, field, cast_to=None, skip_tag=False, print_null=False, indent=1):
+    '''PartitionDirectoryData.pdir_hash: every PartitionDirectoryEntry, each
+    with its PartitionDesc decoded through the entry's own relation key'''
+    htab = node[field]
+    if is_null_pointer(htab):
+        if print_null:
+            return add_indent('[%s] (NULL)' % field, indent, True)
+        return ''
+
+    try:
+        tabname = getchars(htab['tabname'])
+    except gdb.error:
+        tabname = '?'
+
+    items = []
+    try:
+        entry_type = gdb.lookup_type('PartitionDirectoryEntry').pointer()
+        for i, entry in enumerate(hash_table_entries(htab)):
+            formatter = LabelNodeFormatter(entry.cast(entry_type), pseudo_node=True,
+                                           label='[%d] ' % i)
+            items.append(formatter.format())
+    except Exception as e:
+        items.append('<%s: %s>' % (type(e).__name__, e))
+
+    retval = '[%s] (HTAB *) %s %s entries=%d' % (field, htab, tabname, len(items))
+    if len(items) > 0:
+        retval += add_indent('\n'.join(items), 1, True)
+    return add_indent(retval, indent, True)
 #---
 
 def format_node_array(array, start_idx, length, indent=0):
@@ -1672,6 +2794,95 @@ def format_pseudo_node_field(node, fieldname, cast_to=None, skip_tag=False, prin
 
     return ''
 
+def pseudo_node_list_element_type(node, fieldname):
+    '''name of the struct the cells of node[fieldname] point at, None if unknown'''
+    return PSEUDO_NODE_LIST_ELEMENTS.get((get_base_datatype_string(node), fieldname))
+
+def format_pseudo_node_list_field(node, fieldname, cast_to=None, skip_tag=False, newLine=True, print_null=False, indent=1):
+    '''format a List whose cells are pointers to a non-Node struct
+
+    reduce_outer_joins_pass1_state.sub_states is such a list: every cell is
+    another reduce_outer_joins_pass1_state, which carries no NodeTag, so
+    format_node_list() can only say "<unknown NodeTag 130867672 at 0x...>".
+    Cast the cells to the type named in PSEUDO_NODE_LIST_ELEMENTS and dump
+    each one the way 'pgprint' dumps the whole struct.
+    '''
+    global recursion_depth
+
+    lst = node[fieldname]
+    if str(lst) == '0x0':
+        if print_null == True:
+            return add_indent("[%s] (NIL)" % fieldname, indent, True)
+        return ''
+
+    type_name = cast_to
+    if type_name == None:
+        type_name = pseudo_node_list_element_type(node, fieldname)
+    if type_name == None:
+        # nothing better to offer than the generic Node dump
+        return format_optional_node_list(node, fieldname, None, skip_tag,
+                                         newLine, print_null, indent)
+
+    element_type = gdb.lookup_type(type_name).pointer()
+
+    retval = ''
+    indent_add = 0
+    if skip_tag == False:
+        retval += add_indent('[%s]' % fieldname, indent, True)
+        indent_add = 1
+
+    items = []
+    for element in list_elements(lst):
+        if str(element) == '0x0':
+            items.append('(NULL)')
+            continue
+
+        if max_depth_exceeded():
+            items.append('%s %s <max_depth_exceeded>' % (type_name, element))
+            continue
+
+        depth = recursion_depth
+        recursion_depth += 1
+        try:
+            formatter = NodeFormatter(element.cast(element_type), pseudo_node=True)
+            items.append(formatter.format())
+        except Exception as e:
+            items.append("<%s: %s>" % (type(e).__name__, e))
+        finally:
+            recursion_depth = depth
+
+    retval += '\n' + add_indent("\n".join(items), indent + indent_add)
+
+    return retval
+
+def print_pseudo_node_list(expr, lst):
+    '''handle 'pgprint state1->sub_states' -- a List of non-Node structs
+
+    The cells carry no NodeTag, so format_node_list() can only report
+    "<unknown NodeTag 130867672 at 0x...>".  Re-evaluate the parent
+    expression to find the struct owning the list and dump the cells as the
+    type registered for that field.  Returns True when the expression was
+    recognized and printed.
+    '''
+    if not is_a(lst, 'List'):
+        return False
+
+    m = re.match(r'^\s*(.+)(?:->|\.)\s*(\w+)\s*$', expr)
+    if m == None:
+        return False
+
+    try:
+        parent = gdb.parse_and_eval(m.group(1))
+        if pseudo_node_list_element_type(parent, m.group(2)) == None:
+            return False
+        output = format_pseudo_node_list_field(parent, m.group(2),
+                                               skip_tag=True, indent=0)
+    except Exception:
+        return False
+
+    print(output.lstrip('\n'))
+    return True
+
 # ---
 # TupleTableSlot related dumpers
 def tuple_desc_attr(desc, i):
@@ -2193,6 +3404,8 @@ class NodeFormatter(object):
 
         retval += self.format_tree_nodes()
 
+        retval += self.format_summary()
+
         return retval
 
     def format_regular_fields(self, newline_padding_chars):
@@ -2296,6 +3509,29 @@ class NodeFormatter(object):
             recursion_depth = depth
             return add_indent("[%s] <%s: %s>" % (field, type(e).__name__, e), 1, True)
 
+    def format_summary(self):
+        '''a synthesized section registered as FORMATTER_OVERRIDES[type]['summary']
+
+        For structs whose members only make sense side by side -- the
+        parallel per-column arrays of a PartitionKey, the oids/is_leaf/
+        boundinfo of a PartitionDesc -- the named function renders one
+        combined view after the fields themselves.
+        '''
+        global recursion_depth
+
+        if self._formatter_overrides == None:
+            return ''
+        method_name = self._formatter_overrides.get('summary')
+        if method_name == None:
+            return ''
+
+        depth = recursion_depth
+        try:
+            return globals()[method_name](self._node)
+        except Exception as e:
+            recursion_depth = depth
+            return add_indent("[summary] <%s: %s>" % (type(e).__name__, e), 1, True)
+
     def format_all_regular_fields(self, offset):
         formatted_fields = []
         if self.parent_node != None:
@@ -2336,6 +3572,12 @@ class PlanStateFormatter(NodeFormatter):
     def format(self):
         return super().format(prefix='-> ')
 
+PGPRINT_USAGE = """usage: pgprint <expr> [<natts> | <partkey>]
+  <natts>    row width of range-partition bounds (boundinfo->datums)
+  <partkey>  expression holding the partition key used to size and decode
+             the bounds: a PartitionKey, PartitionScheme, Relation,
+             PartitionDispatch, RelOptInfo or PartitionPruneContext"""
+
 class PgPrintCommand(gdb.Command):
     "print PostgreSQL structures"
 
@@ -2348,21 +3590,38 @@ class PgPrintCommand(gdb.Command):
 
         arg_list = gdb.string_to_argv(arg)
         if len(arg_list) not in (1, 2):
-            print("usage: pgprint var [natts]")
+            print(PGPRINT_USAGE)
             return
 
-        # Optional row width for arrays whose element count is not stored
-        # next to them (range-partition boundinfo->datums rows).
+        # The optional second argument sizes and types partition bounds
+        # (boundinfo->datums rows), whose width and column types are not
+        # stored next to them: either a row width, or an expression holding
+        # the partition key (rel->rd_partkey, rel, pd, rel->part_scheme, ...).
         natts = None
+        key = None
         if len(arg_list) == 2:
             try:
                 natts = int(arg_list[1])
             except ValueError:
-                print("usage: pgprint var [natts]")
-                return
+                try:
+                    key = partition_key_info(gdb.parse_and_eval(arg_list[1]))
+                except gdb.error as e:
+                    print("cannot evaluate '%s': %s" % (arg_list[1], e))
+                    return
+                if key == None:
+                    print("'%s' holds no partition key\n%s" % (arg_list[1], PGPRINT_USAGE))
+                    return
+            if natts != None:
+                # a bare row width is a key that knows nothing but partnatts
+                key = PartitionKeyInfo('pgprint natts=%d' % natts, None, natts)
         recursion_depth = 0
 
-        l = gdb.parse_and_eval(arg_list[0])
+        # a dump that died halfway may have left a key behind
+        del partition_key_stack[:]
+        format_with_partition_key(key, self.dump, arg_list[0], natts)
+
+    def dump(self, expr, natts):
+        l = gdb.parse_and_eval(expr)
 
         # Peel off extra pointer levels (e.g. 'pgprint args_p' where
         # args_p is a 'List **' function argument) so the user doesn't
@@ -2378,10 +3637,21 @@ class PgPrintCommand(gdb.Command):
             l = l.dereference()
 
         if not is_node(l):
+            # A bare Bitmapset ('pgprint relids') has its own formatter; the
+            # generic struct walk would only show the address of the words[]
+            # array ("Bitmapset [nwords=1 words=0x5840847296e0]").
+            try:
+                is_bms = get_base_datatype_string(l) in ('Bitmapset', 'struct Bitmapset')
+            except Exception:
+                is_bms = False
+            if is_bms:
+                print("Bitmapset %s" % format_bitmapset(l))
+                return
+
             # Members of a PartitionBoundInfoData (boundinfo->datums, ...)
             # can only be sized with the ndatums/strategy sitting next to
             # them, so route them through the boundinfo-aware dumper.
-            if print_partition_bound_member(arg_list[0], natts):
+            if print_partition_bound_member(expr, natts):
                 return
 
             # The pseudo-node dump walks struct members; scalars, enums and
@@ -2404,6 +3674,11 @@ class PgPrintCommand(gdb.Command):
             formatter = NodeFormatter(l, pseudo_node=True)
             print(formatter.format())
         else:
+            # 'pgprint state1->sub_states': a List of plain structs can only
+            # be typed from the field it hangs off, so look at the expression
+            # before falling back to the generic Node dump.
+            if print_pseudo_node_list(expr, l):
+                return
             print(format_node(l))
 
 PgPrintCommand()

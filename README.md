@@ -48,3 +48,62 @@ PlannedStmt [commandType=CMD_SELECT planGen=PLANGEN_PLANNER queryId=0 hasReturni
 		               lateral=false inFromCl=true requiredPerms=2 selectedCols=0x00000400]
 	[relationOids] OidList: [16392]
 ```
+
+
+Partitioned tables
+------------------
+
+`pgprint` understands the (non-Node) partitioning structs from
+`partdesc.c` / `partbounds.c` / `partcache.c`:
+
+* `PartitionBoundInfoData` -- `datums` / `kind` / `indexes` sized from
+  `ndatums` / `nindexes`, with the bound Datums decoded by the key column
+  types (date, timestamp, numeric, text, uuid, int*, ...); `MINVALUE` /
+  `MAXVALUE` are spelled out, hash rows show `(modulus, remainder)`.
+* `PartitionKeyData` / `PartitionSchemeData` -- one `[columns]` line per key
+  column gathering attnum, type, typlen, collation, opfamily and support
+  function.
+* `PartitionDescData` -- `oids` / `is_leaf` plus a `[partitions]` summary that
+  pairs every partition with its bounds, e.g.
+  `[1] oid=57474 leaf=true FOR VALUES FROM (2020-01-01) TO (2021-01-01)`.
+* `PartitionDirectoryData` -- walks the dynahash table and dumps every
+  `PartitionDirectoryEntry` with its `PartitionDesc`.
+* `PartitionBoundSpec` (a Node) -- its `Const` bounds are decoded by
+  `consttype`.
+
+The row width and column types of range bounds are not stored in the
+boundinfo; they come from the partition key.  They are picked up automatically
+when the key sits next to the partdesc in what you print (`Relation`,
+`PartitionDispatch`, `RelOptInfo`, `PartitionDirectory`), otherwise pass it as
+a second argument:
+
+    (gdb) pgprint pd                             # PartitionDispatch: key + partdesc
+    (gdb) pgprint rel->rd_partdesc rel           # a Relation, or rel->rd_partkey
+    (gdb) pgprint rel->boundinfo rel             # RelOptInfo: uses part_scheme
+    (gdb) pgprint boundinfo->datums key          # any PartitionKey expression
+    (gdb) pgprint boundinfo 2                    # just the row width, raw Datums
+
+```
+PartitionDescData [nparts=5 detached_exist=false last_found_datum_index=-1 last_found_count=0]
+    [oids] (nparts=5) [57469, 57474, 57479, 57484, 57489]
+    [is_leaf] (nparts=5) [true, true, true, true, true]
+    [boundinfo]
+        PartitionBoundInfoData [strategy='r' ndatums=6 interleaved_parts=0x0 nindexes=7 null_index=-1 default_index=4]
+            [datums] (strategy='r' ndatums=6 natts=1 types=[date] from PartitionKeyData 0x6122ffd99900)
+                [0] (MINVALUE)
+                [1] (2020-01-01)
+                [2] (2021-01-01)
+                [3] (2022-01-01)
+                [4] (2023-01-01)
+                [5] (MAXVALUE)
+            [kind] (ndatums=6)
+                [0] (PARTITION_RANGE_DATUM_MINVALUE)
+                ...
+            [indexes] (nindexes=7) [-1, 0, 1, 2, -1, 3, -1]
+    [partitions]
+        [0] oid=57469 leaf=true FOR VALUES FROM (MINVALUE) TO (2020-01-01)
+        [1] oid=57474 leaf=true FOR VALUES FROM (2020-01-01) TO (2021-01-01)
+        [2] oid=57479 leaf=true FOR VALUES FROM (2021-01-01) TO (2022-01-01)
+        [3] oid=57484 leaf=true FOR VALUES FROM (2023-01-01) TO (MAXVALUE)
+        [4] oid=57489 leaf=true DEFAULT
+```
