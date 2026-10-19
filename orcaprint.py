@@ -183,6 +183,54 @@ def print_cdxltabledescr(val):
     print("=" * 80)
 
 
+def get_dxl_datum_str(pdatum):
+    """从 CDXLDatum* 中提取实际值字符串 (CDXLScalarConstValue::m_dxl_datum)"""
+    try:
+        if int(pdatum) == 0:
+            return "NULL"
+        dyn = str(pdatum.dereference().dynamic_type).split("::")[-1].rstrip().rstrip('*').rstrip()
+        # (类型名, 值字段) —— 字段名随 GPDB 版本可能不同，依次尝试
+        known = {
+            "CDXLDatumInt2": ("m_val", "m_value"),
+            "CDXLDatumInt4": ("m_val", "m_value"),
+            "CDXLDatumInt8": ("m_val", "m_value"),
+            "CDXLDatumBool": ("m_value", "m_val"),
+            "CDXLDatumOid": ("m_oid_val", "m_val"),
+        }
+        cast_ptr = pdatum.cast(gdb.lookup_type(f"gpdxl::{dyn}").pointer())
+        is_null = False
+        try:
+            is_null = bool(cast_ptr['m_is_null'])
+        except Exception:
+            pass
+        if is_null:
+            return f"{dyn.replace('CDXLDatum', '')}: NULL"
+        short = dyn.replace("CDXLDatum", "")
+        for tname, fields in known.items():
+            if dyn.startswith(tname):
+                for f in fields:
+                    if _has_field(cast_ptr.dereference(), f):
+                        v = cast_ptr[f]
+                        s = ("true" if bool(v) else "false") if tname == "CDXLDatumBool" else str(int(v))
+                        return f"{short}: {s}"
+        # Generic / Double / 其它：打印 byte 数组 + 长度
+        try:
+            length = int(cast_ptr['m_length'])
+            data = cast_ptr['m_byte_array']
+            if length > 0 and length <= 64 and int(data) != 0:
+                raw = bytes(int((data + i).dereference()) & 0xFF for i in range(length))
+                return f"{short}: len={length} bytes=0x{raw.hex()}"
+            return f"{short}: len={length}"
+        except Exception:
+            pass
+        try:
+            return f"{short}: {float(cast_ptr['m_val'])}"
+        except Exception:
+            return short
+    except Exception as e:
+        return f"<error: {e}>"
+
+
 def print_cdxlnode(val, depth=0, suffix=""):
     pad = mkpad(depth)
     if depth > MAX_DEPTH:
@@ -217,6 +265,10 @@ def print_cdxlnode(val, depth=0, suffix=""):
     elif "CDXLScalarIdent" in dyn_type:
         m_op_dynamic = m_op.cast(gdb.lookup_type("gpdxl::CDXLScalarIdent").pointer())
         print(header + f"  {get_mdname(m_op_dynamic['m_dxl_colref'])} colid: {m_op_dynamic['m_dxl_colref']['m_id']}")
+
+    elif "CDXLScalarConstValue" in dyn_type:
+        m_op_dynamic = m_op.cast(gdb.lookup_type("gpdxl::CDXLScalarConstValue").pointer())
+        print(header + f"  {get_dxl_datum_str(m_op_dynamic['m_dxl_datum'])}")
 
     elif "CDXLScalarProjElem" in dyn_type:
         m_op_dynamic = m_op.cast(gdb.lookup_type("gpdxl::CDXLScalarProjElem").pointer())
