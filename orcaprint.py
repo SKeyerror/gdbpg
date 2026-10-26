@@ -594,6 +594,266 @@ def print_cdparray(val, depth=0):
 
 
 
+def _group_id(pgroup):
+    try:
+        if pgroup == 0:
+            return "NULL"
+        return str(int(pgroup.dereference()['m_id']))
+    except Exception:
+        return "?"
+
+def _enum_str(val, name):
+    try:
+        return str(val[name])
+    except Exception:
+        return "?"
+
+def print_cgroupexpression(val, depth=0):
+    pad = mkpad(depth)
+    pop = val['m_pop']
+    op_name = _op_dynamic_type(pop)
+    print(pad + "=" * 60, flush=True)
+    print(pad + f"CGroupExpression @ {val.address}", flush=True)
+    print(pad + f"  id       = {int(val['m_id'])}", flush=True)
+    print(pad + f"  operator = {op_name}", flush=True)
+    print(pad + f"  group    = {_group_id(val['m_pgroup'])}", flush=True)
+
+    child_ids = []
+    arr_ptr = val['m_pdrgpgroup']
+    if arr_ptr != 0:
+        arr = arr_ptr.dereference()
+        elems = arr['m_elems']
+        child_ids = [_group_id((elems + i).dereference()) for i in range(array_size(arr))]
+    print(pad + f"  children = [{', '.join(child_ids)}]", flush=True)
+
+    print(pad + f"  state    = {_enum_str(val, 'm_estate')}", flush=True)
+    print(pad + f"  opt level= {_enum_str(val, 'm_eol')}", flush=True)
+    print(pad + f"  xform    = {_enum_str(val, 'm_exfidOrigin')}", flush=True)
+    if _has_field(val, 'm_pgexprOrigin') and val['m_pgexprOrigin'] != 0:
+        origin = val['m_pgexprOrigin'].dereference()
+        print(pad + f"  origin   = gexpr {int(origin['m_id'])} (group {_group_id(origin['m_pgroup'])})", flush=True)
+    if val['m_pgexprDuplicate'] != 0:
+        dup = val['m_pgexprDuplicate'].dereference()
+        print(pad + f"  duplicate= gexpr {int(dup['m_id'])}", flush=True)
+    print(pad + f"  circular = {_enum_str(val, 'm_ecirculardependency')}", flush=True)
+    print(pad + "=" * 60, flush=True)
+
+# --------- required plan properties (CReqdPropPlan & friends) ----------
+def _dyn_deref(ptr):
+    """指针 -> 按动态类型转换后的对象(RTTI 找不到时退回静态类型)；NULL 返回 None。"""
+    try:
+        if ptr == 0:
+            return None
+        try:
+            return ptr.cast(ptr.dynamic_type).dereference()
+        except Exception:
+            return ptr.dereference()
+    except Exception:
+        return None
+
+def _list_elems(lst):
+    """遍历 gpos::CList<T>：元素内嵌 SLink，m_head 之后沿 m_next 走。返回元素指针列表。"""
+    res = []
+    offset = int(lst['m_offset'])
+    n = int(lst['m_size'])
+    if n < 0 or n > MAX_ARRAY_ELEMS:
+        raise gdb.GdbError(f"bogus list m_size={n:#x}")
+    vpp = gdb.lookup_type('void').pointer().pointer()
+    elem = lst['m_head']
+    for _ in range(n):
+        if elem == 0:
+            break
+        res.append(elem)
+        raw = elem.cast(gdb.lookup_type('char').pointer()) + offset
+        elem = raw.cast(vpp).dereference().cast(elem.type)  # SLink::m_next 在偏移 0
+    return res
+
+def bitset_members(bs):
+    """CBitSet / CColRefSet 中置位的 bit 下标列表。"""
+    bits = []
+    for link_ptr in _list_elems(bs['m_bsllist']):
+        link = link_ptr.dereference()
+        offset = int(link['m_offset'])
+        vec = link['m_vec'].dereference()
+        nbits = int(vec['m_nbits'])
+        words = vec['m_vec']
+        for i in range(int(vec['m_len'])):
+            w = int((words + i).dereference()) & 0xFFFFFFFFFFFFFFFF
+            b = 0
+            while w:
+                if w & 1:
+                    pos = i * 64 + b
+                    if pos < nbits:
+                        bits.append(offset + pos)
+                w >>= 1
+                b += 1
+    return sorted(bits)
+
+def _hashmap_items(hm):
+    """遍历 gpos::CHashMap：返回 [(key_ptr, value_ptr), ...]。"""
+    items = []
+    nchains = int(hm['m_num_chains'])
+    if nchains < 0 or nchains > MAX_ARRAY_ELEMS:
+        raise gdb.GdbError(f"bogus hashmap m_num_chains={nchains:#x}")
+    chains = hm['m_chains']
+    for c in range(nchains):
+        chain_ptr = (chains + c).dereference()
+        if chain_ptr == 0:
+            continue
+        chain = chain_ptr.dereference()
+        elems = chain['m_elems']
+        for i in range(array_size(chain)):
+            e = (elems + i).dereference().dereference()
+            items.append((e['m_key'], e['m_value']))
+    return items
+
+def _colref_str(pcr):
+    try:
+        if pcr == 0:
+            return "NULL"
+        cr = pcr.dereference()
+        return f"{get_cw_string(cr['m_pname']['m_str_name'])}(id:{int(cr['m_id'])})"
+    except Exception:
+        return "?"
+
+def _colrefset_str(pcrs):
+    try:
+        if pcrs == 0:
+            return "NULL"
+        ids = bitset_members(pcrs.dereference())
+        return "{" + ", ".join(str(i) for i in ids) + "}"
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _mdid_str(pmdid):
+    return f"mdid:{get_oid_from_mdid(pmdid)}"
+
+def _scalar_fields(obj, pad):
+    """打印对象(含基类)里的标量成员：bool/int/enum 类型的 m_xxx。"""
+    typ = obj.type.strip_typedefs()
+    for f in typ.fields():
+        if f.is_base_class:
+            _scalar_fields(obj[f], pad)
+            continue
+        if not f.name or not f.name.startswith('m_'):
+            continue
+        ftype = f.type.strip_typedefs()
+        if ftype.code in (gdb.TYPE_CODE_BOOL, gdb.TYPE_CODE_INT, gdb.TYPE_CODE_ENUM, gdb.TYPE_CODE_FLT):
+            print(pad + f"{f.name} = {obj[f.name]}", flush=True)
+
+def _print_exprarray(arr_ptr, depth):
+    if arr_ptr == 0:
+        print(mkpad(depth) + "  (NULL)", flush=True)
+        return
+    arr = arr_ptr.dereference()
+    elems = arr['m_elems']
+    for i in range(array_size(arr)):
+        e = safe_deref((elems + i).dereference())
+        if e is not None:
+            print_cexpression(e, depth)
+
+def print_orderspec(val, depth=0):
+    pad = mkpad(depth)
+    arr_ptr = val['m_pdrgpoe']
+    if arr_ptr == 0:
+        print(pad + "COrderSpec: (empty)", flush=True)
+        return
+    arr = arr_ptr.dereference()
+    n = array_size(arr)
+    print(pad + f"COrderSpec: {n} column(s)", flush=True)
+    elems = arr['m_elems']
+    for i in range(n):
+        oe = safe_deref((elems + i).dereference())
+        if oe is None:
+            print(pad + f"  [{i}] <NULL>", flush=True)
+            continue
+        print(pad + f"  [{i}] {_colref_str(oe['m_pcr'])}  sortop {_mdid_str(oe['m_mdid'])}  "
+                    f"nulls: {oe['m_ent']}", flush=True)
+
+def print_distspec(val, depth=0):
+    pad = mkpad(depth)
+    obj = _dyn_deref(val.address) or val
+    tname = shorten_type_name(obj.type)
+    print(pad + f"{tname}", flush=True)
+    _scalar_fields(obj, pad + "  ")
+    for fname in ('m_pcrSegmentId', 'm_gp_segment_id'):
+        if _has_field(obj, fname):
+            print(pad + f"  {fname} = {_colref_str(obj[fname])}", flush=True)
+    if _has_field(obj, 'm_pdrgpexpr'):
+        print(pad + "  hash exprs:", flush=True)
+        _print_exprarray(obj['m_pdrgpexpr'], depth + 2)
+        if _has_field(obj, 'm_pdshashedEquiv') and obj['m_pdshashedEquiv'] != 0:
+            print(pad + "  equivalent hashed spec:", flush=True)
+            print_distspec(obj['m_pdshashedEquiv'].dereference(), depth + 2)
+
+def print_rewindspec(val, depth=0):
+    pad = mkpad(depth)
+    print(pad + "CRewindabilitySpec", flush=True)
+    _scalar_fields(val, pad + "  ")
+
+def print_partpropspec(val, depth=0):
+    pad = mkpad(depth)
+    print(pad + "CPartitionPropagationSpec", flush=True)
+    if val['m_scan_ids'] != 0:
+        print(pad + f"  scan_ids = {_colrefset_str(val['m_scan_ids'])}", flush=True)
+    if val['m_part_prop_spec_infos'] == 0:
+        return
+    for k, v in _hashmap_items(val['m_part_prop_spec_infos'].dereference()):
+        info = v.dereference()
+        sel = _colrefset_str(info['m_selector_ids'])
+        print(pad + f"  scan_id {int(info['m_scan_id'])}: {info['m_type']}  "
+                    f"root_rel {_mdid_str(info['m_root_rel_mdid'])}  selector_ids {sel}", flush=True)
+        if info['m_filter_expr'] != 0:
+            print(pad + "    filter:", flush=True)
+            print_cexpression(info['m_filter_expr'].dereference(), depth + 3)
+
+def print_cteReq(val, depth=0):
+    pad = mkpad(depth)
+    print(pad + "CCTEReq", flush=True)
+    if val['m_phmcter'] != 0:
+        for k, v in _hashmap_items(val['m_phmcter'].dereference()):
+            e = v.dereference()
+            print(pad + f"  cte {int(e['m_id'])}: {e['m_ect']}  required={e['m_fRequired']}", flush=True)
+    if val['m_pdrgpulRequired'] != 0:
+        ids = get_dynamic_ptr_array_list(val['m_pdrgpulRequired'])
+        print(pad + f"  required ids = {ids}", flush=True)
+
+def _print_enfd(label, val, spec_field, match_field, printer, depth):
+    pad = mkpad(depth)
+    print(pad + f"{label}  ({val[match_field]})", flush=True)
+    spec = _dyn_deref(val[spec_field])
+    if spec is None:
+        print(pad + "  (NULL)", flush=True)
+    else:
+        printer(spec, depth + 1)
+
+def print_reqdpropplan(val, depth=0):
+    pad = mkpad(depth)
+    print(pad + "=" * 60, flush=True)
+    print(pad + f"CReqdPropPlan @ {val.address}", flush=True)
+    print(pad + f"  columns: {_colrefset_str(val['m_pcrs'])}", flush=True)
+    for label, fld, spec, match, printer in (
+            ("order", 'm_peo', 'm_pos', 'm_eom', print_orderspec),
+            ("distribution", 'm_ped', 'm_pds', 'm_edm', print_distspec),
+            ("rewindability", 'm_per', 'm_prs', 'm_erm', print_rewindspec),
+            ("partition propagation", 'm_pepp', 'm_ppps', 'm_eppm', print_partpropspec)):
+        enfd = safe_deref(val[fld])
+        if enfd is None:
+            print(pad + f"  {label}: (NULL)", flush=True)
+        else:
+            _print_enfd("  " + label + ":", enfd, spec, match, printer, depth + 1)
+    cte = safe_deref(val['m_pcter'])
+    if cte is None:
+        print(pad + "  cte: (NULL)", flush=True)
+    else:
+        print_cteReq(cte, depth + 1)
+    print(pad + "=" * 60, flush=True)
+
+def print_reqdproprelational(val, depth=0):
+    pad = mkpad(depth)
+    print(pad + f"CReqdPropRelational @ {val.address}", flush=True)
+    print(pad + f"  stat columns: {_colrefset_str(val['m_pcrsStat'])}", flush=True)
+
 _SIMPLE_EXPR = re.compile(r'\s*\*?\s*([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*(?:\s*\(\s*\))?|\s*\[\s*\d+\s*\])*)\s*$')
 _SIMPLE_STEP = re.compile(r'\s*(?:(->|\.)\s*([A-Za-z_]\w*)(\s*\(\s*\))?|\[\s*(\d+)\s*\])')
 
@@ -611,6 +871,31 @@ def _find_field(typ, want):
             return f.name
     return None
 
+def _lookup_var(name):
+    """只遍历当前帧的 block 链和当前文件的 static/global block 找变量。
+
+    不能用 Frame.read_var(str) / lookup_global_symbol：它们查不到名字时会走
+    C++ using-directive 的递归查找(cp_lookup_symbol_via_imports)，写错变量名
+    就会让 gdb 卡死。这里只做有限的 block 遍历，找不到直接返回 None。"""
+    frame = gdb.selected_frame()
+    try:
+        block = frame.block()
+    except RuntimeError:
+        block = None
+    while block is not None:
+        if not block.is_global and not block.is_static:
+            for sym in block:
+                if sym.name == name and (sym.is_variable or sym.is_argument):
+                    return sym.value(frame)
+        block = block.superblock
+    symtab = frame.find_sal().symtab
+    if symtab is not None:
+        for blk in (symtab.static_block(), symtab.global_block()):
+            for sym in blk:
+                if sym.name == name and sym.is_variable:
+                    return sym.value()
+    return None
+
 def eval_simple(arg):
     """不经过 gdb 的 C++ 表达式解析器求值 a->b.c[2]->Pfoo() 这类简单链。
 
@@ -624,13 +909,9 @@ def eval_simple(arg):
     if not m:
         return None
     base, rest = m.group(1), m.group(2)
-    try:
-        val = gdb.selected_frame().read_var(base)
-    except (ValueError, gdb.error):
-        sym = gdb.lookup_global_symbol(base) or gdb.lookup_static_symbol(base)
-        if sym is None:
-            raise gdb.GdbError(f"orcaprint: no variable '{base}' in current frame")
-        val = sym.value()
+    val = _lookup_var(base)
+    if val is None:
+        raise gdb.GdbError(f"orcaprint: no variable '{base}' in current frame")
     for st in _SIMPLE_STEP.finditer(rest):
         _, name, call, idx = st.groups()
         if idx is not None:
@@ -676,6 +957,32 @@ class ORCAPrint(gdb.Command):
                 print_cdxlnode(val)
             elif 'CDynamicPtrArray' in tname:
                 print_cdparray(val)
+            elif 'CReqdPropPlan' in tname:
+                print_reqdpropplan(val)
+            elif 'CReqdPropRelational' in tname:
+                print_reqdproprelational(val)
+            elif 'CEnfdOrder' in tname:
+                _print_enfd("CEnfdOrder", val, 'm_pos', 'm_eom', print_orderspec, 0)
+            elif 'CEnfdDistribution' in tname:
+                _print_enfd("CEnfdDistribution", val, 'm_pds', 'm_edm', print_distspec, 0)
+            elif 'CEnfdRewindability' in tname:
+                _print_enfd("CEnfdRewindability", val, 'm_prs', 'm_erm', print_rewindspec, 0)
+            elif 'CEnfdPartitionPropagation' in tname:
+                _print_enfd("CEnfdPartitionPropagation", val, 'm_ppps', 'm_eppm', print_partpropspec, 0)
+            elif 'COrderSpec' in tname:
+                print_orderspec(val)
+            elif 'CDistributionSpec' in tname:
+                print_distspec(val)
+            elif 'CRewindabilitySpec' in tname:
+                print_rewindspec(val)
+            elif 'CPartitionPropagationSpec' in tname:
+                print_partpropspec(val)
+            elif 'CCTEReq' in tname:
+                print_cteReq(val)
+            elif 'CColRefSet' in tname or 'CBitSet' in tname:
+                print(_colrefset_str(val.address))
+            elif 'CGroupExpression' in tname:
+                print_cgroupexpression(val)
             elif 'CExpression' in tname or 'gpopt::CExpression' in tname:
                 print_cexpression(val)
             else:
