@@ -854,8 +854,22 @@ def print_reqdproprelational(val, depth=0):
     print(pad + f"CReqdPropRelational @ {val.address}", flush=True)
     print(pad + f"  stat columns: {_colrefset_str(val['m_pcrsStat'])}", flush=True)
 
-_SIMPLE_EXPR = re.compile(r'\s*\*?\s*([A-Za-z_]\w*)((?:\s*(?:->|\.)\s*[A-Za-z_]\w*(?:\s*\(\s*\))?|\s*\[\s*\d+\s*\])*)\s*$')
-_SIMPLE_STEP = re.compile(r'\s*(?:(->|\.)\s*([A-Za-z_]\w*)(\s*\(\s*\))?|\[\s*(\d+)\s*\])')
+# 安全求值器支持的语法(其余一律交还 gdb 原生解析器):
+#   expr    := ('*' | '&') expr | postfix
+#   postfix := primary ( '->' NAME [args] | '.' NAME [args] | '[' INT ']' )*
+#   primary := NAME | '(' expr ')'
+#   args    := '(' [INT (',' INT)*] ')'      INT 含 0x.. / 负数 / true / false
+_TOKEN = re.compile(r'\s*(->|0[xX][0-9a-fA-F]+|\d+|[A-Za-z_]\w*|[-*&().\[\],])')
+
+def _tokenize(s):
+    toks, pos, s = [], 0, s.rstrip()
+    while pos < len(s):
+        m = _TOKEN.match(s, pos)
+        if not m:
+            return None
+        toks.append(m.group(1))
+        pos = m.end()
+    return toks
 
 def _find_field(typ, want):
     """在类型及其基类中找名字(忽略大小写)为 want 的字段，返回真实字段名。"""
@@ -896,35 +910,292 @@ def _lookup_var(name):
                     return sym.value()
     return None
 
-def eval_simple(arg):
-    """不经过 gdb 的 C++ 表达式解析器求值 a->b.c[2]->Pfoo() 这类简单链。
+def _lookup_global_var(name):
+    """按名字查全局/文件静态变量(如 optimizer、ActivePortal)。
+
+    gdb.lookup_global_symbol/lookup_static_symbol 走 lookup_global_or_static_symbol，
+    只查 objfile 的全局/静态 block，不经过 cp_lookup_symbol_via_imports，
+    查不到会很快返回 None。"""
+    for fn in (gdb.lookup_global_symbol, gdb.lookup_static_symbol):
+        try:
+            sym = fn(name)
+        except gdb.error:
+            sym = None
+        # 头文件里的 extern 声明是 LOC_UNRESOLVED(is_variable 为 False)，
+        # value() 会经 minimal symbol 解析出真实地址
+        if sym is not None and (sym.is_variable or sym.addr_class == gdb.SYMBOL_LOC_UNRESOLVED):
+            try:
+                return sym.value()
+            except gdb.error:
+                pass
+    return None
+
+def _class_chain(typ):
+    """typ 及其所有基类(广度优先)，元素是去掉 typedef 的 struct/class 类型。"""
+    out, todo, seen = [], [typ], set()
+    while todo:
+        t = todo.pop(0).strip_typedefs()
+        if t.code != gdb.TYPE_CODE_STRUCT or t.name is None or t.name in seen:
+            continue
+        seen.add(t.name)
+        out.append(t)
+        for f in t.fields():
+            if f.is_base_class:
+                todo.append(f.type)
+    return out
+
+def _find_method(obj, name):
+    """找 obj(结构体值) 上名为 name 的成员函数，返回 (函数符号, 所属类)。
+
+    用完整限定名 "ns::Class::name" 直接查全局符号，而不是让 gdb 解析
+    `x->name()`：后者会触发 cp_lookup_symbol_via_imports 指数级递归。
+    先查动态类型(RTTI)以保证虚函数调用到正确的 override，再查静态类型。"""
+    types = []
+    try:
+        types.append(obj.dynamic_type)
+    except gdb.error:
+        pass
+    types.append(obj.type)
+    for start in types:
+        for cls in _class_chain(start):
+            try:
+                sym = gdb.lookup_global_symbol(f"{cls.name}::{name}")
+            except gdb.error:
+                sym = None
+            if sym is not None and sym.type is not None and \
+               sym.type.code in (gdb.TYPE_CODE_METHOD, gdb.TYPE_CODE_FUNC):
+                return sym, cls
+    return None, None
+
+def _call_method(val, name, args):
+    """对 val(对象或对象指针) 调用成员函数 name(*args)，找不到函数返回 None。"""
+    obj = val.dereference() if val.type.strip_typedefs().code == gdb.TYPE_CODE_PTR else val
+    sym, cls = _find_method(obj, name)
+    if sym is None:
+        return None
+    this = obj.address.cast(cls.pointer())
+    return sym.value()(this, *args)
+
+class _NotSimple(Exception):
+    pass
+
+class _SafeEval:
+    """按上面的语法递归下降求值，所有名字查找/成员访问都走 Python API。"""
+
+    def __init__(self, toks, call_methods, dry=False):
+        # dry=True 只检查语法不求值：先确认整句都在支持范围内，
+        # 避免像 (CExpression *)x 这样的强转被当成“变量不存在”报错
+        self.toks, self.i, self.call_methods, self.dry = toks, 0, call_methods, dry
+
+    def peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else None
+
+    def take(self, want=None):
+        t = self.peek()
+        if t is None or (want is not None and t != want):
+            raise _NotSimple()
+        self.i += 1
+        return t
+
+    def name(self):
+        t = self.take()
+        if not re.match(r'[A-Za-z_]\w*$', t):
+            raise _NotSimple()
+        return t
+
+    def int_lit(self):
+        neg = self.peek() == '-'
+        if neg:
+            self.take()
+        t = self.take()
+        if t in ('true', 'false') and not neg:
+            return 1 if t == 'true' else 0
+        if not re.match(r'(0[xX][0-9a-fA-F]+|\d+)$', t):
+            raise _NotSimple()
+        return -int(t, 0) if neg else int(t, 0)
+
+    def run(self):
+        v = self.expr()
+        if self.peek() is not None:
+            raise _NotSimple()
+        return v
+
+    def expr(self):
+        t = self.peek()
+        if t in ('*', '&'):
+            self.take()
+            v = self.expr()
+            if self.dry:
+                return None
+            return v.dereference() if t == '*' else v.address
+        return self.postfix()
+
+    def primary(self):
+        if self.peek() == '(':
+            self.take()
+            v = self.expr()
+            self.take(')')
+            return v
+        base = self.name()
+        if self.dry:
+            return None
+        val = _lookup_var(base)
+        if val is None and self.call_methods:
+            val = _lookup_global_var(base)
+        if val is None:
+            raise gdb.GdbError(f"No symbol \"{base}\" in current context.")
+        return val
+
+    def postfix(self):
+        val = self.primary()
+        while True:
+            t = self.peek()
+            if t == '[':
+                self.take()
+                idx = self.int_lit()
+                self.take(']')
+                if self.dry:
+                    continue
+                if val.type.strip_typedefs().code == gdb.TYPE_CODE_STRUCT:
+                    # 对象上的 [n] 是 operator[]，如 CExpression 取第 n 个孩子
+                    res = _call_method(val, "operator[]", [idx])
+                    if res is None:
+                        raise gdb.GdbError(f"cannot apply [] to {val.type}: no operator[] symbol")
+                    val = res
+                else:
+                    val = val[idx]
+            elif t in ('->', '.'):
+                self.take()
+                name = self.name()
+                if self.peek() == '(':
+                    val = self.method(val, name)
+                elif not self.dry:
+                    val = val[name]
+            else:
+                return val
+
+    def method(self, val, name):
+        self.take('(')
+        args = []
+        if self.peek() != ')':
+            args.append(self.int_lit())
+            while self.peek() == ',':
+                self.take()
+                args.append(self.int_lit())
+        self.take(')')
+        if self.dry:
+            return None
+        if self.call_methods:
+            res = _call_method(val, name, args)
+            if res is not None:
+                return res
+        # 访问器 Pfoo() 映射到成员 m_pfoo(ORCA 命名惯例)
+        field = _find_field(val.type, "m_" + name.lower()) if not args else None
+        if field is None:
+            raise gdb.GdbError(f"cannot call {name}() on {val.type}: no such method "
+                               f"symbol (inlined?) and no m_{name.lower()} member")
+        return val[field]
+
+def eval_simple(arg, call_methods=False):
+    """不经过 gdb 的 C++ 表达式解析器求值 (*a)[1]->b.c[2]->Pfoo() 这类表达式。
 
     在 ORCA 代码里 gdb 解析 `x->name` 时会对 name 做符号查找(判断是否类型名)，
     遇到大量 `using namespace gpos/gpopt/...` 时 cp_lookup_symbol_via_imports
     递归穷举，CPU 100% 且 Ctrl-C/SIGTERM 都无效；连 `p pqc->m_pexpr` 都会卡死。
-    这里只对首个变量名做局部查找，字段用 Python API 访问；访问器方法 Pfoo()
-    映射到同名成员 m_pfoo(ORCA 命名惯例)，不做 inferior call。
-    返回 None 表示不是简单链，由调用者回退到 parse_and_eval。"""
-    m = _SIMPLE_EXPR.match(arg)
-    if not m:
+    这里变量名只做有限的 block 查找，字段用 Python API 访问。
+    方法调用：call_methods=True 时按限定名找到成员函数做真正的 inferior call
+    (见 _find_method)；否则或函数不存在(被内联掉)时映射到 m_xxx 成员。
+    对象上的 [n] 调用 operator[]。
+    返回 None 表示超出支持的语法，由调用者回退到 gdb 原生解析。"""
+    toks = _tokenize(arg)
+    if not toks:
         return None
-    base, rest = m.group(1), m.group(2)
-    val = _lookup_var(base)
-    if val is None:
-        raise gdb.GdbError(f"orcaprint: no variable '{base}' in current frame")
-    for st in _SIMPLE_STEP.finditer(rest):
-        _, name, call, idx = st.groups()
-        if idx is not None:
-            val = val[int(idx)]
-            continue
-        field = name
-        if call:
-            field = _find_field(val.type, "m_" + name.lower())
-            if field is None:
-                raise gdb.GdbError(f"orcaprint: cannot map method {name}() to a member "
-                                   f"of {val.type}; use the m_xxx field name instead")
-        val = val[field]
-    return val
+    try:
+        _SafeEval(toks, call_methods, dry=True).run()
+    except _NotSimple:
+        return None
+    return _SafeEval(toks, call_methods).run()
+
+class SafePrintParam(gdb.Parameter):
+    """Evaluate simple C++ member chains in `print` without gdb's expression parser."""
+    set_doc = "Set whether print/p evaluates simple C++ chains via Python."
+    show_doc = "Show whether print/p evaluates simple C++ chains via Python."
+
+    def __init__(self):
+        super().__init__("orca-safe-print", gdb.COMMAND_DATA, gdb.PARAM_BOOLEAN)
+        self.value = True
+
+    def get_show_string(self, svalue):
+        return f"orca-safe-print is {svalue}."
+
+_safe_print_param = SafePrintParam()
+
+_PRINT_FMT = re.compile(r'\s*(/\w+)?\s*(.*)$', re.S)
+
+def _in_cxx_frame():
+    try:
+        return gdb.selected_frame().language() == 'c++'
+    except (gdb.error, AttributeError):
+        return False
+
+class SafePrint(gdb.Command):
+    """Print value of expression EXP (C++-safe wrapper around gdb's print).
+
+Usage: print[/FMT] [EXP]   (also: p, inspect)
+
+In C++ frames, simple chains such as
+    pexprInner->Arity()
+    pexpr->Pop()->Eopid()
+    (*pexpr)[1]->Arity()          (operator[] is called too)
+    *pexpr->m_pdrgpexpr
+    ActivePortal->name            (globals work)
+are evaluated through gdb's Python API: the first name is looked up in
+the current frame/globals, fields are read directly, and methods are
+called by looking up "Class::Method" as a global symbol (dynamic type
+first, so virtual calls dispatch correctly).
+
+Reason: for `x->Name`, gdb 15's C++ parser looks up Name through every
+`using namespace` directive (cp_lookup_symbol_via_imports). In ORCA,
+with hundreds of such directives, that search is exponential: gdb spins
+at 100% CPU and ignores Ctrl-C.
+
+Anything else (casts, arithmetic, print options, $vars, ...) is passed
+to gdb's own evaluator unchanged.  Disable with: set orca-safe-print off"""
+
+    def __init__(self):
+        super().__init__("print", gdb.COMMAND_DATA, gdb.COMPLETE_EXPRESSION)
+
+    def _builtin(self, arg):
+        # 原生 print 已被本命令覆盖；call 与 print 的解析/格式/选项完全一致，
+        # 唯一区别是 void 结果不打印
+        if not arg.strip():
+            arg = "$"  # 与无参数 print 一致：显示上一个历史值
+        gdb.execute("call " + arg, from_tty=True)
+
+    def invoke(self, arg, from_tty):
+        if not _safe_print_param.value or arg.lstrip().startswith('-') or not _in_cxx_frame():
+            return self._builtin(arg)
+        m = _PRINT_FMT.match(arg)
+        fmt, expr = m.group(1) or "", m.group(2)
+        try:
+            val = eval_simple(expr, call_methods=True) if expr else None
+            if val is None:
+                return self._builtin(arg)
+            if val.type.strip_typedefs().code == gdb.TYPE_CODE_VOID:
+                gdb.write("$%d = void\n" % gdb.add_history(val))
+                return
+            val.fetch_lazy()  # 在这里触发 NULL/野指针的读内存错误
+            idx = gdb.add_history(val)
+        except gdb.GdbError:
+            raise
+        except gdb.error as e:  # 含 gdb.MemoryError：按 gdb 原生错误输出，不打 Python 堆栈
+            raise gdb.GdbError(str(e))
+        # 用 output $N 打印：沿用 gdb 自己的格式化(/x、pretty printer、set print ...)
+        gdb.write(f"${idx} = ")
+        gdb.execute(f"output{fmt} ${idx}")
+        gdb.write("\n")
+
+SafePrint()
 
 class ORCAPrint(gdb.Command):
     """ORCAPrint <var> -- Pretty print gpdxl structures (CDXLTableDescr / CDXLNode)"""
@@ -942,7 +1213,8 @@ class ORCAPrint(gdb.Command):
         val = eval_simple(arg)
         if val is None:
             val = gdb.parse_and_eval(arg)
-        val = safe_deref(val)
+        if val.type.strip_typedefs().code == gdb.TYPE_CODE_PTR:
+            val = safe_deref(val)
         if val is None:
             print(f"{arg} is NULL or invalid")
             return

@@ -107,3 +107,28 @@ PartitionDescData [nparts=5 detached_exist=false last_found_datum_index=-1 last_
         [3] oid=57484 leaf=true FOR VALUES FROM (2023-01-01) TO (MAXVALUE)
         [4] oid=57489 leaf=true DEFAULT
 ```
+
+
+ORCA: `print` that does not hang
+--------------------------------
+
+`orcaprint.py` replaces gdb's `print` / `p` / `inspect`. In ORCA (C++)
+frames, gdb 15 can hang forever, at 100% CPU and ignoring Ctrl-C, on things as
+simple as `p pexprInner->Arity()`. For `x->Name` the C++ parser looks up
+`Name` through every `using namespace` directive (`cp_lookup_symbol_via_imports`).
+ORCA translation units have hundreds of those (CUtils.cpp has 402), and the
+search is exponential.
+
+In C++ frames, expressions made only of variables, `*`, `&`, parentheses, `->`,
+`.`, `[N]` and method calls with integer arguments are evaluated through
+gdb's Python API instead:
+
+    (gdb) p pexprInner->Arity()
+    (gdb) p (*(*pexpr)[1])[0]->Pop()->SzId()
+    (gdb) p/d pexpr->Pop()->Eopid()          # virtual call dispatches on the dynamic type
+
+Methods are found by looking up `ns::Class::Method` as a global symbol, so
+no name goes through the using-directive search. `operator[]` is called for
+`[N]` on objects. Anything else (casts, arithmetic, `$` variables, print
+options) goes to gdb's own evaluator unchanged. Turn it off with
+`set orca-safe-print off`.
