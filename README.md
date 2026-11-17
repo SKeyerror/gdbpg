@@ -193,11 +193,11 @@ column, with its path and operator field, plus nodes where it is an outer ref:
       outer @0.1.1.0        CLogicalProject  (outer ref of this subtree)
       use   @0.1.1.0.0.1.1  CScalarIdent.m_pcr
 
-### `orcatrace`: which preprocessing step changed the tree
+### `orcaprint trace`: which preprocessing step changed the tree
 
-    (gdb) orcatrace                # default: CExpressionPreprocessor::PexprPreprocess
-    (gdb) orcatrace --full         # print each changed tree in full instead of a diff
-    (gdb) orcatrace <function>     # any function that chains CExpression* locals
+    (gdb) orcaprint trace            # default: CExpressionPreprocessor::PexprPreprocess
+    (gdb) orcaprint trace --full     # print each changed tree in full instead of a diff
+    (gdb) orcaprint trace <function> # any function that chains CExpression* locals
 
 It steps (`next`) through the function. Each time a `CExpression*` local is
 assigned, it diffs the new tree against the previous one and names the step

@@ -1491,7 +1491,7 @@ def print_colref_usage(root, query, sub=()):
                 print("  !! no node in this tree produces it"
                       " (outer ref of a subtree, or a dangling colref)")
 
-# ---------- orcatrace：逐步 next 过一个函数，打印每一步对 CExpression 的改动 ----------
+# ---------- orcaprint trace：逐步 next 过一个函数，打印每一步对 CExpression 的改动 ----------
 
 def _cexpr_locals(frame):
     """frame 里所有 CExpression* 局部变量/参数 -> 地址"""
@@ -1544,126 +1544,118 @@ def _render(addr):
         lines.append(f"<cannot print: {e}>")
     return lines
 
-class ORCATrace(gdb.Command):
-    """orcatrace [--full] [function]
+def orca_trace(arg):
+    """orcaprint trace [--full] [function]
 在 function（默认 gpopt::CExpressionPreprocessor::PexprPreprocess）里逐行 next，
 每当一个 CExpression* 局部变量被赋值，就把新树和上一棵树 diff 并打印，最后汇总哪些步骤改了树。
 当前不在该函数里时先在入口打临时断点再 continue。跟踪期间暂时禁用其它断点，结束后恢复。
   --full   每个有改动的步骤打印完整的树，而不是 diff"""
+    import difflib
+    args = arg.split()
+    full = "--full" in args
+    args = [a for a in args if a != "--full"]
+    func = args[0] if args else "gpopt::CExpressionPreprocessor::PexprPreprocess"
+    short = func.split("::")[-1]
 
-    def __init__(self):
-        super().__init__("orcatrace", gdb.COMMAND_USER)
+    def frame_matches(f):
+        n = f.name() if f is not None else None
+        if n is None:
+            return False
+        return n == func or n.endswith("::" + func) or ("::" not in func and n.split("::")[-1] == func)
 
-    def invoke(self, arg, from_tty):
-        import difflib
-        self.dont_repeat()
-        args = arg.split()
-        full = "--full" in args
-        args = [a for a in args if a != "--full"]
-        func = args[0] if args else "gpopt::CExpressionPreprocessor::PexprPreprocess"
-        short = func.split("::")[-1]
-
-        def frame_matches(f):
-            n = f.name() if f is not None else None
-            if n is None:
-                return False
-            return n == func or n.endswith("::" + func) or ("::" not in func and n.split("::")[-1] == func)
-
-        try:
+    try:
+        frame = gdb.selected_frame()
+    except gdb.error:
+        raise gdb.GdbError("no process")
+    if not frame_matches(frame):
+        if frame_matches(gdb.newest_frame()):
+            frame = gdb.newest_frame()
+        else:
+            f = frame.older()
+            while f is not None and not frame_matches(f):
+                f = f.older()
+            if f is not None:
+                raise gdb.GdbError(f"{func} is an outer frame; `finish` back to it first, "
+                                   "or run `orcaprint trace` before it is called")
+            print(f"orcaprint trace: waiting for {func} ...")
+            gdb.execute(f"tbreak {func}", to_string=True)
+            gdb.execute("continue")
             frame = gdb.selected_frame()
-        except gdb.error:
-            raise gdb.GdbError("no process")
-        if not frame_matches(frame):
-            if frame_matches(gdb.newest_frame()):
-                frame = gdb.newest_frame()
-            else:
-                f = frame.older()
-                while f is not None and not frame_matches(f):
-                    f = f.older()
-                if f is not None:
-                    raise gdb.GdbError(f"{func} is an outer frame; `finish` back to it first, "
-                                       "or run orcatrace before it is called")
-                print(f"orcatrace: waiting for {func} ...")
-                gdb.execute(f"tbreak {func}", to_string=True)
-                gdb.execute("continue")
-                frame = gdb.selected_frame()
-                if not frame_matches(frame):
-                    raise gdb.GdbError(f"stopped elsewhere ({frame.name()}), not in {func}")
+            if not frame_matches(frame):
+                raise gdb.GdbError(f"stopped elsewhere ({frame.name()}), not in {func}")
 
-        others = [b for b in gdb.breakpoints() if b.enabled and b.is_valid()]
+    others = [b for b in gdb.breakpoints() if b.enabled and b.is_valid()]
+    for b in others:
+        b.enabled = False
+    steps = []
+    try:
+        vars_ = _cexpr_locals(frame)
+        # 起点：第一个 CExpression* 参数
+        cur_name, cur_addr = None, 0
+        blk = frame.block()
+        while blk is not None and blk.function is None:
+            blk = blk.superblock
+        for sym in blk or []:
+            if sym.is_argument and sym.name in vars_:
+                cur_name, cur_addr = sym.name, vars_[sym.name]
+                break
+        with SilenceGDBWarnings():
+            cur = _render(cur_addr) if cur_addr else []
+            print(f"== {frame.name()}  input {cur_name}: {len(cur)} lines")
+            if full:
+                print("\n".join(cur))
+        seen_addrs = {cur_addr}
+        while True:
+            sal = frame.find_sal()
+            first = sal.line
+            before = _cexpr_locals(frame)
+            try:
+                gdb.execute("next", to_string=True)
+            except gdb.error as e:
+                print(f"orcaprint trace: stopped: {e}")
+                break
+            if not frame.is_valid():
+                print(f"== left {short} (returned or threw); now in {gdb.selected_frame().name()}")
+                break
+            newest = gdb.newest_frame()
+            if newest != frame:
+                print(f"orcaprint trace: stopped inside {newest.name()} (signal?); trace aborted")
+                break
+            after = _cexpr_locals(frame)
+            last = frame.find_sal().line
+            for name, addr in after.items():
+                if addr == before.get(name) or addr == 0:
+                    continue
+                callee = _callee_name(sal.symtab, first, last) if sal.symtab else None
+                if addr in seen_addrs:
+                    if callee is None:        # 纯别名赋值，如 pexprConvert2In = pexprUnnested
+                        continue
+                    steps.append((f"{callee} -> {name}", 0, 0))
+                    print(f"-- [{len(steps)}] {callee} -> {name}: unchanged (returned the same object)")
+                    continue
+                seen_addrs.add(addr)
+                with SilenceGDBWarnings():
+                    new = _render(addr)
+                    diff = list(difflib.unified_diff(cur, new, lineterm="", n=2))[2:]
+                    label = f"{callee or '?'} -> {name}"
+                    if not diff:
+                        steps.append((label, 0, 0))
+                        print(f"-- [{len(steps)}] {label}: unchanged")
+                    else:
+                        add = sum(1 for d in diff if d.startswith("+"))
+                        rm = sum(1 for d in diff if d.startswith("-"))
+                        steps.append((label, add, rm))
+                        print(f"-- [{len(steps)}] {label}: +{add} -{rm}  (line {first})")
+                        print("\n".join(new if full else diff))
+                cur = new
+    finally:
         for b in others:
-            b.enabled = False
-        steps = []
-        try:
-            vars_ = _cexpr_locals(frame)
-            # 起点：第一个 CExpression* 参数
-            cur_name, cur_addr = None, 0
-            blk = frame.block()
-            while blk is not None and blk.function is None:
-                blk = blk.superblock
-            for sym in blk or []:
-                if sym.is_argument and sym.name in vars_:
-                    cur_name, cur_addr = sym.name, vars_[sym.name]
-                    break
-            with SilenceGDBWarnings():
-                cur = _render(cur_addr) if cur_addr else []
-                print(f"== {frame.name()}  input {cur_name}: {len(cur)} lines")
-                if full:
-                    print("\n".join(cur))
-            seen_addrs = {cur_addr}
-            while True:
-                sal = frame.find_sal()
-                first = sal.line
-                before = _cexpr_locals(frame)
-                try:
-                    gdb.execute("next", to_string=True)
-                except gdb.error as e:
-                    print(f"orcatrace: stopped: {e}")
-                    break
-                if not frame.is_valid():
-                    print(f"== left {short} (returned or threw); now in {gdb.selected_frame().name()}")
-                    break
-                newest = gdb.newest_frame()
-                if newest != frame:
-                    print(f"orcatrace: stopped inside {newest.name()} (signal?); trace aborted")
-                    break
-                after = _cexpr_locals(frame)
-                last = frame.find_sal().line
-                for name, addr in after.items():
-                    if addr == before.get(name) or addr == 0:
-                        continue
-                    callee = _callee_name(sal.symtab, first, last) if sal.symtab else None
-                    if addr in seen_addrs:
-                        if callee is None:        # 纯别名赋值，如 pexprConvert2In = pexprUnnested
-                            continue
-                        steps.append((f"{callee} -> {name}", 0, 0))
-                        print(f"-- [{len(steps)}] {callee} -> {name}: unchanged (returned the same object)")
-                        continue
-                    seen_addrs.add(addr)
-                    with SilenceGDBWarnings():
-                        new = _render(addr)
-                        diff = list(difflib.unified_diff(cur, new, lineterm="", n=2))[2:]
-                        label = f"{callee or '?'} -> {name}"
-                        if not diff:
-                            steps.append((label, 0, 0))
-                            print(f"-- [{len(steps)}] {label}: unchanged")
-                        else:
-                            add = sum(1 for d in diff if d.startswith("+"))
-                            rm = sum(1 for d in diff if d.startswith("-"))
-                            steps.append((label, add, rm))
-                            print(f"-- [{len(steps)}] {label}: +{add} -{rm}  (line {first})")
-                            print("\n".join(new if full else diff))
-                    cur = new
-        finally:
-            for b in others:
-                if b.is_valid():
-                    b.enabled = True
-        changed = [(k + 1, s) for k, s in enumerate(steps) if s[1] or s[2]]
-        print(f"== {len(steps)} step(s), {len(changed)} changed the tree:")
-        for k, (label, add, rm) in changed:
-            print(f"   [{k}] {label}  +{add} -{rm}")
-
-ORCATrace()
+            if b.is_valid():
+                b.enabled = True
+    changed = [(k + 1, s) for k, s in enumerate(steps) if s[1] or s[2]]
+    print(f"== {len(steps)} step(s), {len(changed)} changed the tree:")
+    for k, (label, add, rm) in changed:
+        print(f"   [{k}] {label}  +{add} -{rm}")
 
 
 def print_cdparray(val, depth=0):
@@ -2366,12 +2358,16 @@ class ORCAPrint(gdb.Command):
         self.dont_repeat()
         usage = ("Usage: orcaprint [-p] [--check] [-n] <expr> [@path]\n"
                  "       orcaprint colref <colid|name> <expr> [@path]\n"
+                 "       orcaprint trace [--full] [function]   (default: CExpressionPreprocessor::PexprPreprocess)\n"
                  "  -p       show derived props ([drvd] out/outer/keys/maxcard, used/defined;\n"
                  "           physical: [plan] derived and [reqd] required dist/order/rewind)\n"
                  "  --check  mark nodes referencing columns nobody produces (!!)\n"
                  "  -n       append each node's @path\n"
                  "  @path    print only that subtree, e.g. @1.0 = child 1 of root, then its child 0")
         toks = arg.split()
+        if toks and toks[0] == "trace":
+            orca_trace(" ".join(toks[1:]))
+            return
         colref_q = None
         if len(toks) >= 3 and toks[0] == "colref":
             colref_q = toks[1]
