@@ -1747,35 +1747,54 @@ def _enum_str(val, name):
     except Exception:
         return "?"
 
-def print_cgroupexpression(val, depth=0):
-    pad = mkpad(depth)
+def _guc_bool(name):
+    """GPDB 的 bool GUC 全局变量；读不到返回 False"""
+    try:
+        sym = gdb.lookup_global_symbol(name) or gdb.lookup_symbol(name)[0]
+        return sym is not None and bool(sym.value())
+    except Exception:
+        return False
+
+def _xform_name(exfid):
+    """CXformFactory::Pxff()->Pxf(exfid)->SzId()；各 xform 的 SzId() 都返回自己的类名"""
+    try:
+        sym = gdb.lookup_global_symbol("gpopt::CXformFactory::m_pxff")
+        if sym is not None and sym.value() != 0:
+            pxf = sym.value().dereference()['m_rgpxf'][int(exfid)]
+            if pxf != 0:
+                return _op_dynamic_type(pxf).split("::")[-1]
+    except Exception:
+        pass
+    e = str(exfid).split("::")[-1]
+    return "CXform" + e[3:] if e.startswith("Exf") else e
+
+def _os_gexpr(val, prefix="", force_origin=False):
+    """CGroupExpression::OsPrintWithPrefix（不含 Cost Ctxts）"""
     pop = val['m_pop']
-    op_name = _op_dynamic_type(pop)
-    print(pad + "=" * 60, flush=True)
-    print(pad + f"CGroupExpression @ {val.address}", flush=True)
-    print(pad + f"  id       = {int(val['m_id'])}", flush=True)
-    print(pad + f"  operator = {op_name}", flush=True)
-    print(pad + f"  group    = {_group_id(val['m_pgroup'])}", flush=True)
+    if pop == 0:
+        return f"{prefix}{int(val['m_id'])}: <NULL operator>"
+    t = _op_dynamic_type(pop).split("::")[-1]
+    s = f"{prefix}{int(val['m_id'])}: {_os_op(None, pop, t)}"
+    if str(val['m_eol']).split("::")[-1] == "EolHigh":
+        s += " (High)"
+    s += " [ " + "".join(_group_id(g) + " " for g in _ptr_elems(val['m_pdrgpgroup'])) + "]"
+    dup = val['m_pgexprDuplicate']
+    if dup != 0:
+        d = dup.dereference()
+        s += f" Dup. of GrpExpr {int(d['m_id'])} in Grp {_group_id(d['m_pgroup'])}"
+    exfid = val['m_exfidOrigin']
+    if (force_origin or _guc_bool("optimizer_print_xform")) and \
+            str(exfid).split("::")[-1] != "ExfInvalid" and val['m_pgexprOrigin'] != 0:
+        o = val['m_pgexprOrigin'].dereference()
+        s += " Origin: "
+        if bool(val['m_fIntermediate']):
+            s += "intermediate result of "
+        s += f"(xform: {_xform_name(exfid)}, Grp: {_group_id(o['m_pgroup'])}, GrpExpr: {int(o['m_id'])})"
+    return s
 
-    child_ids = []
-    arr_ptr = val['m_pdrgpgroup']
-    if arr_ptr != 0:
-        arr = arr_ptr.dereference()
-        elems = arr['m_elems']
-        child_ids = [_group_id((elems + i).dereference()) for i in range(array_size(arr))]
-    print(pad + f"  children = [{', '.join(child_ids)}]", flush=True)
-
-    print(pad + f"  state    = {_enum_str(val, 'm_estate')}", flush=True)
-    print(pad + f"  opt level= {_enum_str(val, 'm_eol')}", flush=True)
-    print(pad + f"  xform    = {_enum_str(val, 'm_exfidOrigin')}", flush=True)
-    if _has_field(val, 'm_pgexprOrigin') and val['m_pgexprOrigin'] != 0:
-        origin = val['m_pgexprOrigin'].dereference()
-        print(pad + f"  origin   = gexpr {int(origin['m_id'])} (group {_group_id(origin['m_pgroup'])})", flush=True)
-    if val['m_pgexprDuplicate'] != 0:
-        dup = val['m_pgexprDuplicate'].dereference()
-        print(pad + f"  duplicate= gexpr {int(dup['m_id'])}", flush=True)
-    print(pad + f"  circular = {_enum_str(val, 'm_ecirculardependency')}", flush=True)
-    print(pad + "=" * 60, flush=True)
+def print_cgroupexpression(val, depth=0, force_origin=False):
+    """CGroupExpression::OsPrint：<id>: <operator> [ <child group ids> ] ..."""
+    print(mkpad(depth) + _os_gexpr(val, force_origin=force_origin))
 
 # --------- required plan properties (CReqdPropPlan & friends) ----------
 def _dyn_deref(ptr):
@@ -2391,6 +2410,10 @@ class ORCAPrint(gdb.Command):
             if opts or path:
                 print_cexpression_checked(val, path, "-p" in opts, "--check" in opts, "-n" in opts)
                 return
+        elif tname == 'gpopt::CGroupExpression' and opts <= {"-p"} and colref_q is None and not path:
+            with SilenceGDBWarnings():
+                print_cgroupexpression(val, force_origin="-p" in opts)
+            return
         elif colref_q is not None or opts or path:
             print(f"orcaprint: colref/-p/--check/-n/@path only apply to CExpression, got '{tname}'")
             return

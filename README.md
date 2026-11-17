@@ -150,6 +150,15 @@ line, then the required plan properties
 (`req CTEs: [..], req order: [..], req dist: [..], ...`). The options below
 also work on a `CQueryContext` and apply to its `m_pexpr`.
 
+`orcaprint <CGroupExpression*>` (e.g. `orcaprint this` inside
+`CGroupExpression::Transform`) prints what `CGroupExpression::OsPrint` prints:
+`<id>: <operator> [ <child group ids> ]`, plus ` (High)`, `Dup. of GrpExpr ..`
+and, when `optimizer_print_xform` is on, `Origin: (xform: .., Grp: .., GrpExpr: ..)`.
+`orcaprint -p <gexpr>` always shows the origin. Cost contexts
+(`optimizer_print_optimization_context`) are not printed.
+
+    1: CLogicalLeftSemiApplyIn (Reqd Inner Cols: "id" (20)) [ 0 15 16 ] Origin: (xform: CXformSelect2Apply, Grp: 4, GrpExpr: 0)
+
 Options (default output is unchanged):
 
     orcaprint -n pexpr           # append each node's path: @root, @0, @0.1, ...
