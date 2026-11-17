@@ -132,3 +132,76 @@ no name goes through the using-directive search. `operator[]` is called for
 `[N]` on objects. Anything else (casts, arithmetic, `$` variables, print
 options) goes to gdb's own evaluator unchanged. Turn it off with
 `set orca-safe-print off`.
+
+
+ORCA: `CExpression` trees
+-------------------------
+
+`orcaprint <CExpression*>` prints the tree in the same format as ORCA's
+`CExpression::OsPrint`, i.e. what `optimizer_print_query` /
+`optimizer_print_plan` log, so the output can be diffed against the log.
+Everything is read from memory; no inferior function is called. The one
+intended difference is text constants: ORCA prints their stats hash
+(`CScalarConst (820420200.000)`), orcaprint prints the string (`CScalarConst ('ab%')`).
+
+`orcaprint <CQueryContext*>` (e.g. `orcaprint pqc`) prints what
+`CQueryContext::OsPrint` / `pqc->DbgPrint()` prints: the `m_pexpr` tree, a blank
+line, then the required plan properties
+(`req CTEs: [..], req order: [..], req dist: [..], ...`). The options below
+also work on a `CQueryContext` and apply to its `m_pexpr`.
+
+Options (default output is unchanged):
+
+    orcaprint -n pexpr           # append each node's path: @root, @0, @0.1, ...
+    orcaprint pexpr @0.1         # print only that subtree (child 0 of root, then its child 1)
+    orcaprint -p pexpr           # derived properties that ORCA has already computed
+    orcaprint --check pexpr      # mark nodes that reference columns nobody produces
+    orcaprint colref v pexpr     # where a column (by name or id) is produced, used, outer ref
+
+`-p` only shows what is already derived (`m_is_prop_derived`); it never
+triggers derivation. Logical/physical nodes get
+`[drvd] out=[..] outer=[..] keys={..} maxcard=N`. Physical nodes also get
+`[plan]` (derived dist/order/rewind) and `[reqd]` (required cols/dist/order/rewind),
+which shows why an enforcer (Motion, Sort, Spool) was added. Scalar nodes
+get `used=` / `defined=`.
+
+    +--CLogicalProject
+       |  [drvd] out=?  outer=["v" (1)]
+       |--CLogicalSelect
+       |  |  [drvd] out=["id" (10), "p" (11), ...]  outer=["v" (1)]
+
+`--check` flags (`!!`) a column reference with no producer anywhere in the
+tree (a dangling colref, or an outer ref when printing a subtree). When
+properties are derived, it also flags a node whose scalar children use
+columns that are neither output by its relational children nor in its outer refs.
+
+`colref` lists every node that produces (`def`) or references (`use`) a
+column, with its path and operator field, plus nodes where it is an outer ref:
+
+    column "v" (1):
+      def   @0.0            CLogicalGet.m_pdrgpcrOutput
+      use   @0.1.0.0        CScalarIdent.m_pcr
+      outer @0.1.1.0        CLogicalProject  (outer ref of this subtree)
+      use   @0.1.1.0.0.1.1  CScalarIdent.m_pcr
+
+### `orcatrace`: which preprocessing step changed the tree
+
+    (gdb) orcatrace                # default: CExpressionPreprocessor::PexprPreprocess
+    (gdb) orcatrace --full         # print each changed tree in full instead of a diff
+    (gdb) orcatrace <function>     # any function that chains CExpression* locals
+
+It steps (`next`) through the function. Each time a `CExpression*` local is
+assigned, it diffs the new tree against the previous one and names the step
+from the source line:
+
+    -- [8] PexprReplaceColWithConst -> pexprPredWithConstReplaced: +8 -4  (line 3731)
+    @@ -1,8 +1,12 @@
+    ...
+    == 31 step(s), 3 changed the tree:
+       [8] PexprReplaceColWithConst -> pexprPredWithConstReplaced  +8 -4
+       [9] PexprReorderScalarCmpChildren -> pexprReorderedScalarCmpChildren  +2 -2
+       [14] PexprInferPredicates -> pexprInferredPreds  +27 -27
+
+If you are not in that function yet, it sets a temporary breakpoint and
+continues. Other breakpoints are disabled during the trace and re-enabled
+afterwards. When it finishes, you are stopped in the caller.

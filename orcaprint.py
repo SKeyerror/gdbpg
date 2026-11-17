@@ -399,133 +399,1272 @@ def get_scalar_const_value_str(pop):
         return f"<error: {e}>"
 
 # --------- printer for gpopt::CExpression ----------
-# def print_cexpression(val, depth=0, max_depth=8):
-#     pad = mkpad(depth)
-#     # print(pad + "-" * 60)
-#     tname = str(val.type.strip_typedefs())
-#
-#     # print(pad + f"{tname} @ {val.address}")
-#     # operator
-#     pop = val['m_pop'] if _has_field(val, 'm_pop') else 0
-#     # print(pad + f"  m_pop (operator): {get_str(pop)}")
-#
-#     dynamic_type = _op_dynamic_type(pop)
-#     if "CLogicalGet" in dynamic_type:
-#         m_op_dynamic = pop.cast(gdb.lookup_type("gpopt::CLogicalGet").pointer())
-#         print(pad + f"operator:  {_op_dynamic_type(pop)}, m_pnameAlias:  {get_cw_string(m_op_dynamic["m_pnameAlias"]["m_str_name"])}", flush=True)
-#     elif "CScalarAggFunc" in dynamic_type:
-#         m_op_dynamic = pop.cast(gdb.lookup_type("gpopt::CScalarAggFunc").pointer())
-#         print(pad + f"operator:  {_op_dynamic_type(pop)}, m_pstrAggFunc:  {get_cw_string(m_op_dynamic["m_pstrAggFunc"])}", flush=True)
-#     elif "CScalarConst" in dynamic_type:
-#         const_val = get_scalar_const_value_str(pop)
-#         print(pad + f"operator:  {dynamic_type} (Value: {const_val})", flush=True)
-#     else:
-#         print(pad + f"operator:  {_op_dynamic_type(pop)}", flush=True)
-#
-#     # children
-#     if _has_field(val, 'm_pdrgpexpr'):
-#         arr = val['m_pdrgpexpr']
-#         if arr == 0:
-#             pass
-#         else:
-#             try:
-#                 n = int(arr['m_size'])
-#                 if n == 0:
-#                     return
-#                 print(pad + f"  children[{n}]:", flush=True)
-#
-#                 elems = arr['m_elems']
-#                 for i in range(n):
-#                     try:
-#                         child_ptr = (elems + i).dereference()
-#                         child = safe_deref(child_ptr)
-#                         if child:
-#                             print(pad + f"    [{i}]:", flush=True)
-#                             print_cexpression(child, depth + 2, max_depth)
-#                         else:
-#                             print(pad + f"    [{i}] = <NULL>", flush=True)
-#                     except Exception as e:
-#                         print(pad + f"    [{i}] = [error: {e}]", flush=True)
-#             except Exception as e:
-#                 print(pad + f"  [warn] cannot expand children: {e}", flush=True)
-def print_cexpression(val, depth=0, suffix=""):
-    pad = mkpad(depth)
-    if depth > MAX_DEPTH:
-        print(pad + f"  [warn] depth > {MAX_DEPTH}, stop (cycle or garbage?)")
+# 输出格式照搬 ORCA 自己的 CExpression::OsPrint（"Algebrized preprocessed query" 那种）：
+#   +--CLogicalSelect
+#      |--CLogicalGet "o" ("o"), Columns: ["k" (0), ...] Key sets: {[2,8]}
+#      +--CScalarCmp (=)
+# 每个算子的那一行按各自的 COperator::OsPrint 拼出来，但只读内存、不调用 inferior 函数。
+
+_ptr_type_cache = {}
+
+def _cast_to(ptr, cls):
+    """把指针转为 <cls>*（不带命名空间时默认 gpopt::）并解引用。"""
+    t = _ptr_type_cache.get(cls)
+    if t is None:
+        t = gdb.lookup_type(cls if '::' in cls else "gpopt::" + cls).pointer()
+        _ptr_type_cache[cls] = t
+    return ptr.cast(t).dereference()
+
+def _ptr_elems(arr_ptr):
+    """CDynamicPtrArray<T>* -> [T*, ...]"""
+    if arr_ptr == 0:
+        return []
+    arr = arr_ptr.dereference()
+    elems = arr['m_elems']
+    return [(elems + i).dereference() for i in range(array_size(arr))]
+
+def _os_name(cname):
+    """CName / CName* -> "name"（CName::OsPrint 带双引号）"""
+    return '"' + get_cw_string(cname['m_str_name']) + '"'
+
+def _os_colref(pcr):
+    """CColRef::OsPrint: "name" (id)"""
+    try:
+        if pcr == 0:
+            return "NULL"
+        cr = pcr.dereference()
+        return f"{_os_name(cr['m_pname'])} ({int(cr['m_id'])})"
+    except Exception:
+        return "?"
+
+def _os_colrefs(arr_ptr):
+    """CUtils::OsPrintDrgPcr"""
+    try:
+        return ", ".join(_os_colref(p) for p in _ptr_elems(arr_ptr))
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _os_wstr(p):
+    """CWStringBase* -> GetBuffer()"""
+    try:
+        return "" if p == 0 else get_cw_string(p.dereference())
+    except Exception:
+        return "?"
+
+def _os_mdid(pmdid):
+    """CMDIdGPDB::OsPrint: (type.oid.major.minor)"""
+    try:
+        if pmdid == 0:
+            return "(NULL)"
+        m = _cast_to(pmdid, "gpmd::CMDIdGPDB")
+        return (f"({int(m['m_sysid']['m_mdid_type'])}.{int(m['m_oid'])}."
+                f"{int(m['m_major_version'])}.{int(m['m_minor_version'])})")
+    except Exception:
+        return "(?)"
+
+def _mdid_oid(pmdid):
+    try:
+        return None if pmdid == 0 else int(_cast_to(pmdid, "gpmd::CMDIdGPDB")['m_oid'])
+    except Exception:
+        return None
+
+_TEXT_OIDS = {25, 1042, 1043, 19, 18}                      # IsTextRelated
+_LINT_OIDS = {2950, 790}                                   # uuid, cash
+_DOUBLE_OIDS = {1700, 700, 701,                            # numeric, float4, float8
+                1082, 1083, 1266, 1114, 1184, 702, 703, 1186, 704,   # 时间类
+                869, 650, 829}                             # inet, cidr, macaddr
+
+def _decode_text_datum(d, oid):
+    size = int(d['m_size'])
+    if size <= 0 or size > 1 << 20:
+        return None
+    raw = bytes(gdb.selected_inferior().read_memory(d['m_bytearray_value'], min(size, 4096)))
+    if oid == 18:
+        return raw[:1].decode('latin-1')
+    if oid == 19:
+        return raw.split(b'\0', 1)[0].decode('utf-8', 'replace')
+    if raw[0] & 0x01:                                       # varlena 1 字节短头
+        body = raw[1:(raw[0] >> 1)]
+    else:                                                   # varlena 4 字节头
+        body = raw[4:(int.from_bytes(raw[:4], 'little') >> 2)]
+    return body.decode('utf-8', 'replace')
+
+def _os_datum(pdatum):
+    """IDatum::OsPrint"""
+    try:
+        if pdatum == 0:
+            return "NULL"
+        dt = _op_dynamic_type(pdatum)
+        for cls in ("CDatumInt2GPDB", "CDatumInt4GPDB", "CDatumInt8GPDB", "CDatumOidGPDB"):
+            if cls in dt:
+                d = _cast_to(pdatum, "gpnaucrates::" + cls)
+                return "null" if bool(d['m_is_null']) else str(int(d['m_val']))
+        if "CDatumBoolGPDB" in dt:
+            d = _cast_to(pdatum, "gpnaucrates::CDatumBoolGPDB")
+            return "null" if bool(d['m_is_null']) else str(int(bool(d['m_value'])))
+        if "CDatumGenericGPDB" in dt:
+            # CDatumGenericGPDB::GetStrRepr
+            d = _cast_to(pdatum, "gpnaucrates::CDatumGenericGPDB")
+            if bool(d['m_is_null']):
+                return "null"
+            oid = _mdid_oid(d['m_mdid'])
+            if oid in _TEXT_OIDS:
+                # ORCA 这里打印的是文本的 LINT 哈希（%0.3f），没有可读性；改为打印原文
+                s = _decode_text_datum(d, oid)
+                if s is not None:
+                    return "'" + s + "'"
+            if oid in _TEXT_OIDS or oid in _LINT_OIDS:
+                return "%0.3f" % float(int(d['m_stats_comp_val_int']))
+            if oid in _DOUBLE_OIDS:
+                return "%0.3f" % float(d['m_stats_comp_val_double']['m_d'])
+            size = int(d['m_size'])
+            raw = bytes(gdb.selected_inferior().read_memory(d['m_bytearray_value'], min(size, 4096)))
+            return raw.hex().upper()
+        return f"<{dt}>"
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _os_orderspec(pos):
+    """COrderSpec::OsPrint"""
+    try:
+        oes = [safe_deref(p) for p in _ptr_elems(pos.dereference()['m_pdrgpoe'])]
+        if not oes:
+            return "<empty>"
+        nulls = {0: "Auto", 1: "NULLsFirst", 2: "NULLsLast"}
+        return "".join(f"( {_os_mdid(oe['m_mdid'])}, {_os_colref(oe['m_pcr'])}, "
+                       f"{nulls.get(int(oe['m_ent']), '?')} ) " for oe in oes if oe is not None)
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _os_distspec(pds, prefix=""):
+    """CDistributionSpec*::OsPrint / CDistributionSpecHashed::OsPrintWithPrefix"""
+    try:
+        if pds == 0:
+            return "NULL"
+        t = _op_dynamic_type(pds).split("::")[-1]
+        if t in ("CDistributionSpecHashed", "CDistributionSpecStrictHashed", "CDistributionSpecHashedNoOp"):
+            szid = {"CDistributionSpecHashed": "HASHED", "CDistributionSpecStrictHashed": "STRICT HASHED",
+                    "CDistributionSpecHashedNoOp": "HASHED NO-OP"}[t]
+            d = _cast_to(pds, "CDistributionSpecHashed")
+            exprs = [p.dereference() for p in _ptr_elems(d['m_pdrgpexpr'])]
+            s = f"{szid}: [ "
+            for e in exprs:
+                pop = e['m_pop']
+                et = _op_dynamic_type(pop).split("::")[-1]
+                if len(exprs) == 1 and et == "CScalarIdent":
+                    s += _os_op(e, pop, et)
+                else:                      # os << *(hash_expr)：整棵子树，每行以换行结尾
+                    lines = []
+                    _os_expr_lines(e, "", True, 0, lines)
+                    s += "\n".join(lines) + "\n" + prefix
+            s += ", nulls colocated" if bool(d['m_fNullsColocated']) else ", nulls not colocated"
+            if bool(d['m_is_duplicate_sensitive']):
+                s += ", duplicate sensitive"
+            if not bool(d['m_fSatisfiedBySingleton']):
+                s += ", across-segments"
+            s += " ]"
+            if d['m_opfamilies'] != 0:
+                fams = _ptr_elems(d['m_opfamilies'])
+                if fams:
+                    s += ", opfamilies: " + "".join(_os_mdid(f) + "," for f in fams)
+            return s
+        if t in ("CDistributionSpecSingleton", "CDistributionSpecStrictSingleton"):
+            seg = "coordinator" if int(_cast_to(pds, "CDistributionSpecSingleton")['m_est']) == 0 else "segment"
+            return ("STRICT SINGLETON" if "Strict" in t else "SINGLETON") + f" ({seg})"
+        if t == "CDistributionSpecUniversal":
+            return "UNIVERSAL "
+        if t == "CDistributionSpecNonSingleton":
+            s = "NON-SINGLETON "
+            if not bool(_cast_to(pds, t)['m_fAllowReplicated']):
+                s += " (NON-REPLICATED)"
+            return s
+        if t == "CDistributionSpecRandom":
+            return "RANDOM"
+        if t == "CDistributionSpecStrictRandom":
+            return "STRICT RANDOM"
+        if t == "CDistributionSpecAny":
+            return f"ANY  EOperatorId: {int(_cast_to(pds, t)['m_eopidRequested'])} "
+        if t == "CDistributionSpecNonReplicated":
+            return "NON-REPLICATED"
+        if t == "CDistributionSpecReplicated":
+            r = str(_cast_to(pds, t)['m_replicated']).split("::")[-1]
+            return {"EdtReplicated": "REPLICATED", "EdtTaintedReplicated": "TAINTED REPLICATED",
+                    "EdtStrictReplicated": "STRICT REPLICATED"}.get(r, r)
+        if t == "CDistributionSpecRouted":
+            return f"ROUTED: [ {_os_colref(_cast_to(pds, t)['m_pcrSegmentId'])} ]"
+        return t
+    except Exception as e:
+        return f"<error: {e}>"
+
+_FRAME_BOUNDARY = ["Unbounded Preceding", "Bounded Preceding", "Current", "Unbounded Following",
+                   "Bounded Following", "Delayed Bounded Preceding", "Delayed Bounded Following"]
+_FRAME_EXCLUSION = ["None", "Nulls", "Current", "MatchingOthers", "Ties"]
+
+def _os_windowframes(arr_ptr):
+    """CWindowFrame::OsPrint(os, array)"""
+    try:
+        out = []
+        for p in _ptr_elems(arr_ptr):
+            wf = p.dereference()
+            efs = _enum_short(wf['m_efs'], "Efs")
+            if efs == "Sentinel":
+                out.append("EMPTY FRAME")
+                continue
+            def bound(fld, efld):
+                s = _FRAME_BOUNDARY[int(wf[fld])]
+                if wf[efld] != 0:                 # os << " " << *pexpr：整棵子树
+                    lines = []
+                    _os_expr_lines(wf[efld].dereference(), "", True, 0, lines)
+                    s += " " + "\n".join(lines) + "\n"
+                return s
+            out.append(f"[{efs}, Trail: {bound('m_efbTrailing', 'm_pexprTrailing')}, "
+                       f"Lead: {bound('m_efbLeading', 'm_pexprLeading')}, "
+                       f"{_FRAME_EXCLUSION[int(wf['m_efes'])]}]")
+        return "[" + ", ".join(out) + "]"
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _enum_short(v, prefix):
+    s = str(v).split("::")[-1]
+    return s[len(prefix):] if s.startswith(prefix) else s
+
+def _os_tabdesc_name(ptabdesc):
+    """CTableDescriptor* 或 CTableDescriptorHashSet*（取第一个）的 Name()"""
+    if ptabdesc == 0:
+        return '""'
+    td = ptabdesc
+    if _has_field(td.dereference(), 'm_elements'):
+        elems = _ptr_elems(td.dereference()['m_elements'])
+        if not elems:
+            return '""'
+        td = elems[0]
+    return _os_name(td.dereference()['m_name'])
+
+def _os_keysets(ptabdesc, ncols):
+    td = ptabdesc
+    if _has_field(td.dereference(), 'm_elements'):
+        td = _ptr_elems(td.dereference()['m_elements'])[0]
+    sets = []
+    for pbs in _ptr_elems(td.dereference()['m_pdrgpbsKeys']):
+        bits = [b for b in bitset_members(pbs.dereference()) if b < ncols]
+        sets.append("[" + ",".join(str(b) for b in bits) + "]")
+    return "{" + ", ".join(sets) + "}"
+
+_GBAGG_TYPE = {0: "Global", 1: "Local", 2: "Intermediate"}
+
+def _os_op(val, pop, t):
+    """COperator::OsPrint 的各个 override"""
+    try:
+        if bool(pop.dereference()['m_fPattern']):
+            return t
+    except Exception:
+        pass
+    try:
+        if t in ("CLogicalGet", "CLogicalForeignGet"):
+            op = _cast_to(pop, "CLogicalGet")
+            cols = _ptr_elems(op['m_pdrgpcrOutput'])
+            return (f"{t} {_os_name(op['m_pnameAlias'])} ({_os_tabdesc_name(op['m_ptabdesc'])}), "
+                    f"Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}] "
+                    f"Key sets: {_os_keysets(op['m_ptabdesc'], len(cols))}")
+        if t in ("CLogicalDynamicGet", "CLogicalDynamicForeignGet"):
+            op = _cast_to(pop, "CLogicalDynamicGetBase")
+            nparts = array_size(op['m_partition_mdids'].dereference()) if op['m_partition_mdids'] != 0 else 0
+            return (f"{t} {_os_name(op['m_pnameAlias'])} ({_os_tabdesc_name(op['m_ptabdesc'])}), "
+                    f"Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}] Scan Id: {int(op['m_scan_id'])} "
+                    f"Parts to scan: {nparts}")
+        if t in ("CLogicalIndexGet", "CLogicalIndexOnlyGet"):
+            op = _cast_to(pop, "CLogicalIndexGet")
+            s = (f"{t}   Index Name: ({_os_name(op['m_pindexdesc']['m_name'])}), "
+                 f"Table Name: ({_os_name(op['m_pnameAlias'])}), Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}]")
+            if "Backward" in str(op['m_scan_direction']):
+                s += ", Backward Scan"
+            return s
+        if t in ("CLogicalDynamicIndexGet", "CLogicalDynamicIndexOnlyGet"):
+            op = _cast_to(pop, "CLogicalDynamicIndexGet")
+            base = _cast_to(pop, "CLogicalDynamicGetBase")
+            return (f"{t}   Index Name: ({_os_name(op['m_pindexdesc']['m_name'])}), "
+                    f"Table Name: ({_os_name(base['m_pnameAlias'])}), "
+                    f"Columns: [{_os_colrefs(base['m_pdrgpcrOutput'])}] Scan Id: {int(base['m_scan_id'])}")
+        if t == "CLogicalBitmapTableGet":
+            op = _cast_to(pop, t)
+            return (f"{t} , Table Name: ({_os_tabdesc_name(op['m_ptabdesc'])}), "
+                    f"Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}]")
+        if t == "CLogicalDynamicBitmapTableGet":
+            op = _cast_to(pop, "CLogicalDynamicGetBase")
+            return (f"{t} , Table Name: ({_os_tabdesc_name(op['m_ptabdesc'])}) Scan Id: {int(op['m_scan_id'])}, "
+                    f"Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}]")
+        if t == "CLogicalConstTableGet":
+            op = _cast_to(pop, t)
+            rows = []
+            for prow in _ptr_elems(op['m_pdrgpdrgpdatum']):
+                rows.append("(" + ", ".join(_os_datum(d) for d in _ptr_elems(prow)) + ")")
+            return f"{t} Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}] Values: [{'; '.join(rows)}]"
+        if t in ("CLogicalGbAgg", "CLogicalGbAggDeduplicate"):
+            op = _cast_to(pop, "CLogicalGbAgg")
+            gtype = _GBAGG_TYPE.get(int(op['m_egbaggtype']), "?")
+            minimal = _os_colrefs(op['m_pdrgpcrMinimal']) if op['m_pdrgpcrMinimal'] != 0 else ""
+            dup = int(bool(op['m_fGeneratesDuplicates']))
+            if t == "CLogicalGbAggDeduplicate":
+                keys = _os_colrefs(_cast_to(pop, t)['m_pdrgpcrKeys'])
+                return (f"{t}( {gtype} ) Grp Cols: [{_os_colrefs(op['m_pdrgpcr'])}], Minimal Grp Cols: [{minimal}], "
+                        f"Join Child Keys: [{keys}], Generates Duplicates :[ {dup} ] ")
+            s = (f"{t}( {gtype} ) Grp Cols: [{_os_colrefs(op['m_pdrgpcr'])}][{gtype}], "
+                 f"Minimal Grp Cols: [{minimal}]")
+            if gtype == "Intermediate":
+                s += f", Distinct Cols:[{_os_colrefs(op['m_pdrgpcrArgDQA'])}]"
+            s += f", Generates Duplicates :[ {dup} ] "
+            stage = int(op['m_aggStage'])
+            if stage == 0:
+                s += ", m_aggStage :[  Two Stage Scalar DQA  ] "
+            elif stage == 1:
+                s += ", m_aggStage :[  Three Stage Scalar DQA  ] "
+            return s
+        if t == "CLogicalLimit":
+            op = _cast_to(pop, t)
+            return (f"{t} {_os_orderspec(op['m_pos'])} {'global' if bool(op['m_fGlobal']) else 'local'}"
+                    + (" NonRemovableLimit" if bool(op['m_top_limit_under_dml']) else ""))
+        if t == "CLogicalNAryJoin":
+            op = _cast_to(pop, t)
+            if op['m_lojChildPred'] == 0:
+                return t
+            vals = [str(int(p.dereference())) for p in _ptr_elems(op['m_lojChildPred'])]
+            return f"{t} [{', '.join(vals)}]"
+        if t.startswith("CLogical") and "Apply" in t:
+            op = _cast_to(pop, "CLogicalApply")
+            if op['m_pdrgpcrInner'] == 0:
+                return t
+            return f"{t} (Reqd Inner Cols: {_os_colrefs(op['m_pdrgpcrInner'])})"
+        if t in ("CLogicalUnion", "CLogicalUnionAll", "CLogicalIntersect", "CLogicalIntersectAll",
+                 "CLogicalDifference", "CLogicalDifferenceAll"):
+            op = _cast_to(pop, "CLogicalSetOp")
+            ins = ", ".join(f"({_os_colrefs(p)})" for p in _ptr_elems(op['m_pdrgpdrgpcrInput']))
+            return f"{t} Output: ({_os_colrefs(op['m_pdrgpcrOutput'])}), Input: [{ins}]"
+        if t in ("CLogicalCTEConsumer", "CLogicalCTEProducer"):
+            op = _cast_to(pop, t)
+            return f"{t} ({int(op['m_id'])}), Columns: [{_os_colrefs(op['m_pdrgpcr'])}]"
+        if t == "CLogicalCTEAnchor":
+            return f"{t} ({int(_cast_to(pop, t)['m_id'])})"
+        if t == "CLogicalSequenceProject":
+            op = _cast_to(pop, t)
+            ords = "[" + ", ".join(_os_orderspec(p) for p in _ptr_elems(op['m_pdrgpos'])) + "]"
+            return (f"{t} (Partition By Keys:{_os_distspec(op['m_pds'])}, Order Spec:{ords}, "
+                    f"WindowFrame Spec:{_os_windowframes(op['m_pdrgpwf'])})")
+        if t == "CLogicalInsert":
+            op = _cast_to(pop, t)
+            return (f"{t} ({_os_tabdesc_name(op['m_ptabdesc'])}), "
+                    f"Source Columns: [{_os_colrefs(op['m_pdrgpcrSource'])}]")
+
+        # ---- physical ----
+        if t.startswith("CPhysical"):
+            r = _os_physical(pop, t)
+            if r is not None:
+                return r
+
+        # ---- scalar ----
+        if t == "CScalarIdent":
+            return f"{t} {_os_colref(_cast_to(pop, t)['m_pcr'])}"
+        if t == "CScalarProjectElement":
+            return f"{t} {_os_colref(_cast_to(pop, t)['m_pcr'])}"
+        if t == "CScalarConst":
+            return f"{t} ({_os_datum(_cast_to(pop, t)['m_pdatum'])})"
+        if t in ("CScalarCmp", "CScalarIsDistinctFrom"):
+            return f"{t} ({_os_wstr(_cast_to(pop, 'CScalarCmp')['m_pstrOp'])})"
+        if t == "CScalarOp":
+            return f"{t} ({_os_wstr(_cast_to(pop, t)['m_pstrOp'])})"
+        if t == "CScalarBoolOp":
+            return f"{t} ({str(_cast_to(pop, t)['m_eboolop']).split('::')[-1]})"
+        if t == "CScalarBooleanTest":
+            words = ["Is True", "Is Not True", "Is False", "Is Not False", "Is Unknown", "Is Not Unknown"]
+            i = int(_cast_to(pop, t)['m_ebt'])
+            return f"{t} ({words[i] if 0 <= i < len(words) else '?'})"
+        if t == "CScalarBitmapBoolOp":
+            i = int(_cast_to(pop, t)['m_ebitmapboolop'])
+            return f"{t} ({['BitmapAnd', 'BitmapOr'][i] if i in (0, 1) else '?'})"
+        if t == "CScalarFunc":
+            return f"{t} ({_os_wstr(_cast_to(pop, t)['m_pstrFunc'])})"
+        if t == "CScalarWindowFunc":
+            op = _cast_to(pop, t)
+            name = _os_wstr(_cast_to(pop, "CScalarFunc")['m_pstrFunc'])
+            b = lambda f: "true" if bool(op[f]) else "false"
+            return (f"{t} ({name} , Agg: {b('m_fAgg')} , Distinct: {b('m_is_distinct')} , "
+                    f"StarArgument: {b('m_is_star_arg')} , SimpleAgg: {b('m_is_simple_agg')})")
+        if t == "CScalarAggFunc":
+            op = _cast_to(pop, t)
+            stage = {0: "Global", 1: "Intermediate", 2: "Local"}.get(int(op['m_eaggfuncstage']), "?")
+            return (f"{t} ({_os_wstr(op['m_pstrAggFunc'])} , Distinct: "
+                    f"{'true' if bool(op['m_is_distinct']) else 'false'} , Aggregate Stage: {stage})")
+        if t == "CScalarArrayCmp":
+            op = _cast_to(pop, t)
+            kind = "Any" if int(op['m_earrccmpt']) == 0 else "All"
+            return f"{t} {kind} ({_os_wstr(op['m_pscOp'])})"
+        if t == "CScalarArray":
+            op = _cast_to(pop, t)
+            s = f"CScalarArray: {{eleMDId: {_os_mdid(op['m_pmdidElem'])}, arrayMDId: {_os_mdid(op['m_pmdidArray'])}"
+            if bool(op['m_fMultiDimensional']):
+                s += ", multidimensional"
+            for pc in _ptr_elems(op['m_pdrgPconst']):
+                s += f" CScalarConst ({_os_datum(pc.dereference()['m_pdatum'])})"
+            return s + "}"
+        if t == "CScalarMinMax":
+            return f"{t} ({'Min' if int(_cast_to(pop, t)['m_esmmt']) == 0 else 'Max'})"
+        if t == "CScalarParam":
+            return f"{t} ({int(_cast_to(pop, t)['m_id'])})"
+        if t == "CScalarSortGroupClause":
+            op = _cast_to(pop, t)
+            b = lambda f: "true" if bool(op[f]) else "false"
+            return (f"{t}(tleSortGroupRef:{int(op['m_tle_sort_group_ref'])},eqop:{int(op['m_eqop'])},"
+                    f"sortop:{int(op['m_sortop'])},nulls_first:{b('m_nulls_first')},hashable:{b('m_hashable')})")
+        if t == "CScalarSubquery":
+            op = _cast_to(pop, t)
+            s = f"{t}[{_os_colref(op['m_pcr'])}]"
+            if bool(op['m_fGeneratedByExist']):
+                s += " generated by Exist SQ"
+            if bool(op['m_fGeneratedByQuantified']):
+                s += " generated by Quantified SQ"
+            return s
+        if t in ("CScalarSubqueryAny", "CScalarSubqueryAll"):
+            op = _cast_to(pop, "CScalarSubqueryQuantified")
+            return f"{t}({_os_wstr(op['m_pstrScalarOp'])})[{_os_colref(op['m_pcr'])}]"
+        if t == "CScalarAssertConstraint":
+            return f"{t} (ErrorMsg: {_os_wstr(_cast_to(pop, t)['m_pstrErrorMsg'])})"
+    except Exception as e:
+        return f"{t} <error: {e}>"
+    return t
+
+def _os_physical(pop, t):
+    if t in ("CPhysicalScalarAgg", "CPhysicalHashAgg", "CPhysicalStreamAgg"):
+        op = _cast_to(pop, "CPhysicalAgg")
+        gtype = _GBAGG_TYPE.get(int(op['m_egbaggtype']), "?")
+        s = f"{t}( {gtype}" + (", multi-stage" if bool(op['m_fMultiStage']) else "") + " )"
+        s += f" Grp Cols: [{_os_colrefs(op['m_pdrgpcr'])}], Minimal Grp Cols:[{_os_colrefs(op['m_pdrgpcrMinimal'])}]"
+        if gtype == "Intermediate":
+            s += f", Distinct Cols:[{_os_colrefs(op['m_pdrgpcrArgDQA'])}]"
+        s += f", Generates Duplicates :[ {int(bool(op['m_fGeneratesDuplicates']))} ] "
+        stage = int(op['m_aggStage'])
+        if stage == 0:
+            s += ", m_aggStage :[ Two Stage Scalar DQA ] "
+        elif stage == 1:
+            s += ", m_aggStage :[ Three Stage Scalar DQA ] "
+        return s
+    if t in ("CPhysicalHashAggDeduplicate", "CPhysicalStreamAggDeduplicate"):
+        op = _cast_to(pop, "CPhysicalAgg")
+        keys = _os_colrefs(_cast_to(pop, t)['m_pdrgpcrKeys'])
+        return (f"{t}( {_GBAGG_TYPE.get(int(op['m_egbaggtype']), '?')} ) Grp Cols: [{_os_colrefs(op['m_pdrgpcr'])}]"
+                f", Key Cols:[{keys}], Generates Duplicates :[ {int(bool(op['m_fGeneratesDuplicates']))} ] ")
+    if t in ("CPhysicalTableScan", "CPhysicalForeignScan"):
+        op = _cast_to(pop, "CPhysicalScan")
+        return f"{t} {_os_name(op['m_pnameAlias'])} ({_os_tabdesc_name(op['m_ptabdesc'])})"
+    if t in ("CPhysicalDynamicTableScan", "CPhysicalDynamicForeignScan"):
+        op = _cast_to(pop, "CPhysicalDynamicScan")
+        sc = _cast_to(pop, "CPhysicalScan")
+        nparts = array_size(op['m_partition_mdids'].dereference()) if op['m_partition_mdids'] != 0 else 0
+        return (f"{t} {_os_name(sc['m_pnameAlias'])} ({_os_tabdesc_name(sc['m_ptabdesc'])}), "
+                f"Columns: [{_os_colrefs(sc['m_pdrgpcrOutput'])}] Scan Id: {int(op['m_scan_id'])} "
+                f"Parts to scan: {nparts}")
+    if t in ("CPhysicalIndexScan", "CPhysicalIndexOnlyScan"):
+        op = _cast_to(pop, t)
+        sc = _cast_to(pop, "CPhysicalScan")
+        s = (f"{t}   Index Name: ({_os_name(op['m_pindexdesc']['m_name'])}), "
+             f"Table Name: ({_os_tabdesc_name(sc['m_ptabdesc'])}), Columns: [{_os_colrefs(sc['m_pdrgpcrOutput'])}]")
+        if "Backward" in str(op['m_scan_direction']):
+            s += ", Backward Scan"
+        return s
+    if t in ("CPhysicalDynamicIndexScan", "CPhysicalDynamicIndexOnlyScan"):
+        op = _cast_to(pop, "CPhysicalDynamicIndexScan")
+        dyn = _cast_to(pop, "CPhysicalDynamicScan")
+        sc = _cast_to(pop, "CPhysicalScan")
+        return (f"{t}   Index: ({_os_name(op['m_pindexdesc']['m_name'])}), "
+                f"Table: ({_os_tabdesc_name(sc['m_ptabdesc'])}), Columns: [{_os_colrefs(sc['m_pdrgpcrOutput'])}]"
+                f" Scan Id: {int(dyn['m_scan_id'])}")
+    if t in ("CPhysicalBitmapTableScan", "CPhysicalDynamicBitmapTableScan"):
+        sc = _cast_to(pop, "CPhysicalScan")
+        return (f"{t} , Table Name: ({_os_tabdesc_name(sc['m_ptabdesc'])}), "
+                f"Columns: [{_os_colrefs(sc['m_pdrgpcrOutput'])}]")
+    if t == "CPhysicalLimit":
+        op = _cast_to(pop, t)
+        return f"{t} {_os_orderspec(op['m_pos'])} {'global' if bool(op['m_fGlobal']) else 'local'}"
+    if t == "CPhysicalMotionGather":
+        op = _cast_to(pop, t)
+        est = int(op['m_pdssSingeton'].dereference()['m_est'])
+        s = t + ("(coordinator)" if est == 0 else "(segment)")
+        if op['m_pos'] != 0 and _ptr_elems(op['m_pos'].dereference()['m_pdrgpoe']):
+            s += _os_orderspec(op['m_pos'])
+        return s
+    if t == "CPhysicalMotionBroadcast":
+        return t + " "
+    if t == "CPhysicalMotionHashDistribute":
+        op = _cast_to(pop, t)
+        return f"{t} " + _os_distspec(op['m_pdsHashed'], " " * 40)
+    if t == "CPhysicalMotionRandom":
+        op = _cast_to(pop, t)
+        dup = op['m_pdsRandom'] != 0 and bool(op['m_pdsRandom'].dereference()['m_is_duplicate_sensitive'])
+        return t + (" (dup sensitive) " if dup else "")
+    if t == "CPhysicalSpool":
+        return f"{t} (" + ("Blocking)" if bool(_cast_to(pop, t)['m_eager']) else "Streaming)")
+    if t == "CPhysicalSort":
+        return f"{t}  " + _os_orderspec(_cast_to(pop, t)['m_pos'])
+    if t == "CPhysicalSequenceProject":
+        op = _cast_to(pop, t)
+        ords = "[" + ", ".join(_os_orderspec(p) for p in _ptr_elems(op['m_pdrgpos'])) + "]"
+        return f"{t} ({_os_distspec(op['m_pds'])}, {ords}, {_os_windowframes(op['m_pdrgpwf'])})"
+    if t.startswith("CPhysicalCorrelated") and t.endswith("NLJoin"):
+        op = _cast_to(pop, t)
+        return f"{t}({_os_colrefs(op['m_pdrgpcrInner'])})"
+    if t == "CPhysicalPartitionSelector":
+        op = _cast_to(pop, t)
+        return (f"{t}, Id: {int(op['m_selector_id'])}, Scan Id: {int(op['m_scan_id'])}, "
+                f"Part Table: {_os_mdid(op['m_mdid'])}")
+    if t == "CPhysicalConstTableGet":
+        op = _cast_to(pop, t)
+        rows = ["(" + ", ".join(_os_datum(d) for d in _ptr_elems(prow)) + ")"
+                for prow in _ptr_elems(op['m_pdrgpdrgpdatum'])]
+        return f"{t} Columns: [{_os_colrefs(op['m_pdrgpcrOutput'])}] Values: [{'; '.join(rows)}]"
+    if t in ("CPhysicalCTEConsumer", "CPhysicalCTEProducer"):
+        op = _cast_to(pop, t)
+        return f"{t} ({int(op['m_id'])}), Columns: [{_os_colrefs(op['m_pdrgpcr'])}]"
+    return None
+
+def _os_stats(val):
+    """CExpression::OsPrintExpression 里非标量算子的 rows/width/rebinds"""
+    try:
+        ps = val['m_pstats']
+        if ps == 0:
+            return ""
+        st = _cast_to(ps, "gpnaucrates::CStatistics")
+        rows = int(float(st['m_rows']['m_d']))
+        width = 0.0
+        if st['m_colid_width_mapping'] != 0:
+            for _, v in _hashmap_items(st['m_colid_width_mapping'].dereference()):
+                width += float(v.dereference()['m_d'])
+        import math
+        rebinds = int(float(st['m_num_rebinds']['m_d']))
+        if width <= 0:
+            width = 1e-300       # CDouble 会把 0 夹到 GPOS_FP_ABS_MIN，Ceil() 之后是 1
+        return f"   rows:{rows}   width:{int(math.ceil(width))}  rebinds:{rebinds}"
+    except Exception:
+        return ""
+
+_ULONG_MAX = 0xFFFFFFFF
+
+def print_cexpression(val, depth=0, suffix="", ctx=None, path=()):
+    # depth 只决定整棵树的起始缩进（供其它打印函数嵌套调用）；suffix 保留参数兼容，不再使用
+    # ctx: _ExprCtx（-p / --check / -n 时才有）；path: val 在 ctx.root 里的路径
+    lines = []
+    _os_expr_lines(val, mkpad(depth), True, 0, lines, ctx, tuple(path))
+    for l in lines:
+        print(l)
+
+def _os_expr_lines(val, prefix, last, level, out, ctx=None, path=()):
+    """CExpression::OsPrintExpression；ctx 非空时追加 path / !! / 属性行"""
+    line = prefix + ("+--" if last else "|--")
+    child_prefix = prefix + ("   " if last else "|  ")
+    if level > MAX_DEPTH:
+        out.append(line + f"[warn] depth > {MAX_DEPTH}, stop (cycle or garbage?)")
         return
+    pop, t = _expr_op(val)
+    if pop is None:
+        out.append(line + "<NULL operator>")
+        return
+
+    s = _os_op(val, pop, t)
+    if not t.startswith("CScalar"):
+        s += _os_stats(val)
+    if t.startswith("CPhysical"):
+        try:
+            s += "   cost:%f" % float(val['m_cost']['m_d'])        # COstream << DOUBLE 用 %f
+        except Exception:
+            pass
+    try:
+        grp = int(val['m_ulOriginGrpId'])
+        if grp != _ULONG_MAX:
+            s += f"   origin: [Grp:{grp}, GrpExpr:{int(val['m_ulOriginGrpExprId'])}]"
+    except Exception:
+        pass
+    if ctx is not None:
+        if ctx.paths:
+            s += "   " + _path_str(path)
+        for msg in ctx.flags.get(path, ()):
+            s += "   !! " + msg
+    out.append(line + s)
+
+    try:
+        children = _expr_children(val)
+    except Exception as e:
+        out.append(child_prefix + f"+--[warn] child access error: {e}")
+        return
+    if ctx is not None and ctx.props:
+        pp = child_prefix + ("|  " if children else "   ")
+        for pl in _props_lines(val, t, ctx):
+            out.append(pp + pl)
+    for i, c in enumerate(children):
+        if c is None:
+            out.append(child_prefix + ("+--" if i == len(children) - 1 else "|--") + "<NULL child>")
+            continue
+        _os_expr_lines(c, child_prefix, i == len(children) - 1, level + 1, out, ctx, path + (i,))
+
+# ---------- 树遍历 / 路径 (@1.0 = 根的第 1 个孩子的第 0 个孩子) ----------
+
+def _expr_op(val):
     pop = val['m_pop'] if _has_field(val, 'm_pop') else 0
     if pop == 0:
+        return None, None
+    return pop, _op_dynamic_type(pop).split("::")[-1]
+
+def _expr_children(val):
+    """孩子列表；空指针孩子以 None 占位，保证下标和 ORCA 一致"""
+    if not _has_field(val, 'm_pdrgpexpr') or val['m_pdrgpexpr'] == 0:
+        return []
+    return [safe_deref(p) for p in _ptr_elems(val['m_pdrgpexpr'])]
+
+def _path_str(path):
+    return "@" + ".".join(str(i) for i in path) if path else "@root"
+
+def _parse_path(s):
+    s = s.lstrip("@")
+    if s in ("", "root"):
+        return ()
+    try:
+        return tuple(int(x) for x in s.split("."))
+    except ValueError:
+        raise gdb.GdbError(f"bad path '@{s}', expected e.g. @1.0.2")
+
+def _subexpr(val, path):
+    for k, i in enumerate(path):
+        ch = _expr_children(val)
+        if i >= len(ch) or ch[i] is None:
+            raise gdb.GdbError(f"{_path_str(path[:k])} has no child {i} (arity {len(ch)})")
+        val = ch[i]
+    return val
+
+def _walk(val, path=(), level=0):
+    yield val, path
+    if level > MAX_DEPTH:
         return
+    for i, c in enumerate(_expr_children(val)):
+        if c is not None:
+            yield from _walk(c, path + (i,), level + 1)
 
-    dynamic_type = _op_dynamic_type(pop)
-    clean_type = dynamic_type.split("::")[-1]
+# ---------- 算子里引用的列 ----------
+# 扫描算子对象(含基类)中所有 CColRef* / CColRefArray* / CColRef2dArray* / CColRefSet* 成员，
+# 不靠逐个算子手写，新算子也能覆盖。
 
-    header = pad + f"  ▶ {clean_type}"
-    if suffix:
-        header += f" ({suffix})"
+_CR_FIELDS = {}
+_CR_SKIP = {'m_pcrsLocalUsed'}      # CLogical 的缓存，不是算子语义的一部分
 
-    # --- 针对性解析逻辑 ---
+def _colref_fields(typ):
+    typ = typ.strip_typedefs()
+    key = str(typ)
+    res = _CR_FIELDS.get(key)
+    if res is not None:
+        return res
+    res = []
+    def scan(t, seen):
+        for f in t.fields():
+            if f.is_base_class:
+                bt = f.type.strip_typedefs()
+                if str(bt) not in seen:
+                    seen.add(str(bt))
+                    scan(bt, seen)
+                continue
+            if not f.name or f.name in _CR_SKIP or not hasattr(f, 'bitpos'):
+                continue                                    # 跳过 static 成员
+            try:
+                ft = f.type.strip_typedefs()
+                if ft.code != gdb.TYPE_CODE_PTR:
+                    continue
+                tn = str(ft.target().unqualified().strip_typedefs())     # const CColRef *
+            except Exception:
+                continue
+            if tn == 'gpopt::CColRef':
+                res.append((f.name, 'one'))
+            elif tn.startswith('gpos::CDynamicPtrArray<gpopt::CColRef,'):
+                res.append((f.name, 'arr'))
+            elif tn.startswith('gpos::CDynamicPtrArray<gpos::CDynamicPtrArray<gpopt::CColRef,'):
+                res.append((f.name, 'arr2'))
+            elif tn == 'gpopt::CColRefSet':
+                res.append((f.name, 'set'))
+    scan(typ, {key})
+    _CR_FIELDS[key] = res
+    return res
 
-    # 1. 处理投影元素 (CScalarProjectElement)
-    if "CScalarProjectElement" in clean_type:
-        m_op_dynamic = pop.cast(gdb.lookup_type("gpopt::CScalarProjectElement").pointer())
-        pcr_ptr = m_op_dynamic['m_pcr']
-        if pcr_ptr != 0:
-            pcr = pcr_ptr.dereference()
-            # 这里的 m_pname 是 CWStringConst
-            col_name = get_cw_string(pcr['m_pname']['m_str_name'])
-            print(header + f"  Defined Col: {col_name} (id: {pcr['m_id']})")
-        else:
-            print(header)
+def _is_def_field(t, fname):
+    """该成员是否“产生”列（其余都算引用）"""
+    if fname in ('m_pdrgpcrOutput', 'm_pcrsOutput'):
+        return True
+    if fname == 'm_pcr' and t == 'CScalarProjectElement':
+        return True
+    if fname == 'm_pdrgpcr' and t in ('CLogicalCTEConsumer', 'CPhysicalCTEConsumer'):
+        return True
+    return False
 
-    # 2. 处理比较运算 (CScalarCmp)
-    elif "CScalarCmp" in clean_type:
-        m_op_dynamic = pop.cast(gdb.lookup_type("gpopt::CScalarCmp").pointer())
-        op_name = get_cw_string(m_op_dynamic['m_pstrOp'])
-        # 也可以从 m_mdid_op 获取 OID，如果需要的话
-        print(header + f"  Op: '{op_name}'")
-
-    # 3. 处理逻辑查询 (CLogicalGet)
-    elif "CLogicalGet" in clean_type:
-        m_op_dynamic = pop.cast(gdb.lookup_type("gpopt::CLogicalGet").pointer())
-        alias = get_cw_string(m_op_dynamic["m_pnameAlias"]["m_str_name"])
-        print(header + f"  Alias: {alias}")
-
-    # 4. 处理标量标识符 (CScalarIdent)
-    elif "CScalarIdent" in clean_type:
-        m_op_dynamic = pop.cast(gdb.lookup_type("gpopt::CScalarIdent").pointer())
-        pcr = m_op_dynamic['m_pcr'].dereference()
-        col_name = get_cw_string(pcr['m_pname']['m_str_name'])
-        print(header + f"  {col_name} colid: {pcr['m_id']}")
-
-    else:
-        print(header)
-
-    # --- 递归处理子节点 ---
-    if _has_field(val, 'm_pdrgpexpr') and val['m_pdrgpexpr'] != 0:
+def _node_colrefs(pop):
+    """[(field, kind, [(id, name|None), ...]), ...]"""
+    obj = _cast_to(pop, _op_dynamic_type(pop))
+    out = []
+    for fname, kind in _colref_fields(obj.type):
         try:
-            arr = val['m_pdrgpexpr'].dereference()
-            num = array_size(arr)
-            elems = arr['m_elems']
+            v = obj[fname]
+            if v == 0:
+                continue
+            if kind == 'set':
+                out.append((fname, kind, [(i, None) for i in bitset_members(v.dereference())]))
+                continue
+            if kind == 'one':
+                crs = [v]
+            elif kind == 'arr':
+                crs = _ptr_elems(v)
+            else:
+                crs = [c for a in _ptr_elems(v) if a != 0 for c in _ptr_elems(a)]
+            ids = []
+            for p in crs:
+                if p == 0:
+                    continue
+                cr = p.dereference()
+                ids.append((int(cr['m_id']), get_cw_string(cr['m_pname']['m_str_name'])))
+            out.append((fname, kind, ids))
+        except Exception:
+            continue
+    return out
 
-            for i in range(num):
-                child_ptr = (elems + i).dereference()
-                child = safe_deref(child_ptr)
-                if child:
-                    # 智能后缀推断
-                    new_suffix = ""
-                    if "CLogicalSelect" in clean_type:
-                        new_suffix = "data" if i == 0 else "condition"
-                    elif "CLogicalProject" in clean_type:
-                        new_suffix = "data" if i == 0 else "proj_list"
-                    elif "CScalarSubqueryExists" in clean_type:
-                        new_suffix = "subquery"
-                    elif "CScalarCmp" in clean_type:
-                        new_suffix = "left" if i == 0 else "right"
+# ---------- 已推导属性（只读 m_is_prop_derived 已置位的，不触发推导） ----------
 
-                    print_cexpression(child, depth + 2, new_suffix)
-        except Exception as e:
-            print(pad + f"  [warn] child access error: {e}")
+def _drvd_bits(d, nbits):
+    try:
+        if bool(d['m_is_complete']):
+            return set(range(nbits))
+    except Exception:
+        pass
+    bs = d['m_is_prop_derived']
+    return set(bitset_members(bs.dereference())) if bs != 0 else set()
+
+def _crs_ids(p):
+    return [] if p == 0 else bitset_members(p.dereference())
+
+_MAXCARD_UNBOUNDED = 0xFFFFFFFF            # GPOPT_MAX_CARD = (ULLONG) gpos::ulong_max
+
+def _drvd_rel(val):
+    """CDrvdPropRelational；没推导过的键不出现。未分配返回 None"""
+    try:
+        p = val['m_pdprel']
+        if p == 0:
+            return None
+        d = p.dereference()
+        bits = _drvd_bits(d, 12)              # CDrvdPropRelational::EdptSentinel
+        r = {}
+        for bit, key, fld in ((0, 'out', 'm_pcrsOutput'), (1, 'outer', 'm_pcrsOuter'),
+                              (2, 'notnull', 'm_pcrsNotNull'), (3, 'corr', 'm_pcrsCorrelatedApply')):
+            if bit in bits:
+                r[key] = _crs_ids(d[fld])
+        if 4 in bits:
+            r['keys'] = [] if d['m_pkc'] == 0 else \
+                [_crs_ids(k) for k in _ptr_elems(d['m_pkc'].dereference()['m_pdrgpcrs'])]
+        if 6 in bits:
+            r['maxcard'] = int(d['m_maxcard']['m_ull'])
+        if 10 in bits:
+            r['joindepth'] = int(d['m_ulJoinDepth'])
+        return r
+    except Exception:
+        return None
+
+def _drvd_scalar(val):
+    try:
+        p = val['m_pdpscalar']
+        if p == 0:
+            return None
+        d = p.dereference()
+        bits = _drvd_bits(d, 13)              # CDrvdPropScalar::EdptSentinel
+        r = {}
+        for bit, key, fld in ((0, 'defined', 'm_pcrsDefined'), (1, 'used', 'm_pcrsUsed'),
+                              (2, 'srf', 'm_pcrsSetReturningFunction')):
+            if bit in bits:
+                r[key] = _crs_ids(d[fld])
+        if 3 in bits:
+            r['subq'] = bool(d['m_fHasSubquery'])
+        return r
+    except Exception:
+        return None
+
+_RWD = {"ErtRewindable": "REWINDABLE", "ErtRescannable": "RESCANNABLE", "ErtNone": "NONE",
+        "ErtMarkRestore": "MARK-RESTORE"}
+
+def _os_rewind(prs):
+    """CRewindabilitySpec::OsPrint"""
+    try:
+        if prs == 0:
+            return "NULL"
+        r = prs.dereference()
+        s = _RWD.get(str(r['m_rewindability']).split("::")[-1], str(r['m_rewindability']))
+        mh = str(r['m_motion_hazard']).split("::")[-1]
+        return s + {"EmhtMotion": " MOTION", "EmhtNoMotion": " NO-MOTION"}.get(mh, "")
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _hashmap_values_ordered(hm_ptr):
+    """CHashMapIter 的顺序：按 m_keys（插入顺序）取 value"""
+    if hm_ptr == 0:
+        return []
+    hm = hm_ptr.dereference()
+    d = {int(k): v for k, v in _hashmap_items(hm)}
+    return [d[int(k)] for k in _ptr_elems(hm['m_keys']) if int(k) in d]
+
+def _os_bitset(pbs):
+    """CBitSet::OsPrint: {1, 2}"""
+    return "{" + ", ".join(str(b) for b in _crs_ids(pbs)) + "}"
+
+def _os_partprop(ppps):
+    """CPartitionPropagationSpec::OsPrint"""
+    try:
+        if ppps == 0:
+            return ""
+        infos = _hashmap_values_ordered(ppps.dereference()['m_part_prop_spec_infos'])
+        if not infos:
+            return "<empty>"
+        out = []
+        for pi in infos:
+            i = pi.dereference()
+            ty = str(i['m_type']).split("::")[-1]
+            kind = {"EpptConsumer": "consumer", "EpptPropagator": "propagator"}.get(ty, "")
+            out.append(f"{kind}<{int(i['m_scan_id'])}>({_os_bitset(i['m_selector_ids'])})")
+        return ", ".join(out)
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _is_cte_producer(ect):
+    return str(ect).split("::")[-1] == "EctProducer"
+
+def _os_ctemap(pcm):
+    """CCTEMap::OsPrint"""
+    try:
+        if pcm == 0:
+            return ""
+        s = ""
+        for pe in _hashmap_values_ordered(pcm.dereference()['m_phmcm']):
+            e = pe.dereference()
+            s += f"{int(e['m_id'])}{'p' if _is_cte_producer(e['m_ect']) else 'c'}"
+            if e['m_pdpplan'] != 0:
+                s += f"({_os_drvdplan(e['m_pdpplan'])})"
+            s += " "
+        return s
+    except Exception as e:
+        return f"<error: {e}>"
+
+def _os_drvdplan(pdp):
+    """CDrvdPropPlan::OsPrint"""
+    d = pdp.dereference()
+    return (f"Drvd Plan Props (ORD: {_os_orderspec(d['m_pos'])}, DIST: {_os_distspec(d['m_pds'])}, "
+            f"REWIND: {_os_rewind(d['m_prs'])}, PART PROP:{_os_partprop(d['m_ppps'])}), "
+            f"CTE Map: [{_os_ctemap(d['m_pcm'])}]")
+
+def _os_ctereq(pcter):
+    """CCTEReq::OsPrint"""
+    try:
+        s = ""
+        for pe in _hashmap_values_ordered(pcter.dereference()['m_phmcter']):
+            e = pe.dereference()
+            s += (f"{int(e['m_id'])}{':p' if _is_cte_producer(e['m_ect']) else ':c'}"
+                  f"{' ' if bool(e['m_fRequired']) else '(opt) '}")
+            if e['m_pdpplan'] != 0:
+                s += "Plan Props: " + _os_drvdplan(e['m_pdpplan'])
+        return s
+    except Exception as e:
+        return f"<error: {e}>"
+
+_DIST_MATCH = ["exact", "satisfy", "subset"]
+
+def _os_reqdpropplan(prpp):
+    """CReqdPropPlan::OsPrint（req cols 只在 trace flag 101016 打开时才打，这里同默认不打）"""
+    if prpp == 0:
+        return "NULL"
+    r = prpp.dereference()
+    s = "req CTEs: ["
+    if r['m_pcter'] != 0:
+        s += _os_ctereq(r['m_pcter'])
+    s += "], req order: ["
+    if r['m_peo'] != 0:
+        s += _os_orderspec(r['m_peo'].dereference()['m_pos']) + " match: satisfy "
+    s += "], req dist: ["
+    if r['m_ped'] != 0:
+        ed = r['m_ped'].dereference()
+        m = int(ed['m_edm'])
+        s += _os_distspec(ed['m_pds']) + " match: " + (_DIST_MATCH[m] if 0 <= m < 3 else str(m))
+    s += "], req rewind: ["
+    if r['m_per'] != 0:                     # ORCA 原样：这里把 "], req rewind: [" 又打了一遍
+        s += "], req rewind: [" + _os_rewind(r['m_per'].dereference()['m_prs']) + " match: satisfy"
+    s += "], req partition propagation: ["
+    if r['m_pepp'] != 0:
+        s += _os_partprop(r['m_pepp'].dereference()['m_ppps']) + " match: satisfy "
+    return s + "]"
+
+def print_cquerycontext(val):
+    """CQueryContext::OsPrint: os << *m_pexpr << std::endl << *m_prpp"""
+    pexpr = safe_deref(val['m_pexpr'])
+    if pexpr is None:
+        print("m_pexpr: NULL")
+    else:
+        print_cexpression(pexpr)
+    print("")
+    print(_os_reqdpropplan(val['m_prpp']))
+
+def _one_line(s):
+    return " ".join(x.strip() for x in s.split("\n") if x.strip())
+
+def _ids_str(ids, ctx):
+    return "[" + ", ".join(ctx.colname(i) for i in ids) + "]"
+
+def _props_lines(val, t, ctx):
+    lines = []
+    if t.startswith("CScalar"):
+        d = _drvd_scalar(val)
+        if d:                                   # 标量节点很多，没推导过就不占行
+            parts = []
+            if d.get('used'):
+                parts.append("used=" + _ids_str(d['used'], ctx))
+            if d.get('defined'):
+                parts.append("defined=" + _ids_str(d['defined'], ctx))
+            if d.get('srf'):
+                parts.append("srf=" + _ids_str(d['srf'], ctx))
+            if d.get('subq'):
+                parts.append("has-subquery")
+            if parts:
+                lines.append("[drvd] " + "  ".join(parts))
+        return lines
+
+    d = _drvd_rel(val)
+    if not d:
+        lines.append("[drvd] <not derived>")
+    else:
+        parts = [f"{k}=" + (_ids_str(d[k], ctx) if k in d else "?") for k in ('out', 'outer')]
+        if d.get('corr'):
+            parts.append("corr-apply=" + _ids_str(d['corr'], ctx))
+        if 'keys' in d:
+            parts.append("keys={" + ", ".join("[" + ",".join(map(str, k)) + "]" for k in d['keys']) + "}")
+        if 'maxcard' in d:
+            mc = d['maxcard']
+            parts.append("maxcard=" + ("unbounded" if mc >= _MAXCARD_UNBOUNDED else str(mc)))
+        lines.append("[drvd] " + "  ".join(parts))
+
+    try:
+        pp = val['m_pdpplan']
+        if pp != 0:
+            p = pp.dereference()
+            lines.append(f"[plan] dist={_one_line(_os_distspec(p['m_pds']))}  "
+                         f"order={_os_orderspec(p['m_pos']).strip()}  rewind={_os_rewind(p['m_prs'])}")
+    except Exception:
+        pass
+    try:
+        pr = val['m_prpp']
+        if pr != 0:
+            r = pr.dereference()
+            parts = ["cols=" + _ids_str(_crs_ids(r['m_pcrs']), ctx)]
+            for label, fld, spec, fn in (("dist", 'm_ped', 'm_pds', lambda x: _one_line(_os_distspec(x))),
+                                         ("order", 'm_peo', 'm_pos', lambda x: _os_orderspec(x).strip()),
+                                         ("rewind", 'm_per', 'm_prs', _os_rewind)):
+                if r[fld] != 0:
+                    parts.append(f"{label}={fn(r[fld].dereference()[spec])}")
+            lines.append("[reqd] " + "  ".join(parts))
+    except Exception:
+        pass
+    return lines
+
+# ---------- 上下文：列名、产生/引用位置、检查结果 ----------
+
+class _ExprCtx:
+    def __init__(self, root, props=False, check=False, paths=False):
+        self.root = root
+        self.props, self.check, self.paths = props, check, paths
+        self.names = {}            # colid -> name
+        self.defs = {}             # colid -> [path]
+        self.refs = []             # (path, t, field, kind, colid, is_def)
+        self.nodes = {}            # path -> (val, t)
+        self.flags = {}            # path -> [msg]
+        self.notes = []
+        self._scan()
+        if check:
+            self._check()
+
+    def colname(self, i):
+        n = self.names.get(i)
+        return f'"{n}" ({i})' if n is not None else f"({i})"
+
+    def flag(self, path, msg):
+        lst = self.flags.setdefault(path, [])
+        if msg not in lst:
+            lst.append(msg)
+
+    def _scan(self):
+        for val, path in _walk(self.root):
+            pop, t = _expr_op(val)
+            if pop is None:
+                continue
+            self.nodes[path] = (val, t)
+            for fname, kind, ids in _node_colrefs(pop):
+                isdef = _is_def_field(t, fname)
+                for i, name in ids:
+                    if name is not None:
+                        self.names.setdefault(i, name)
+                    self.refs.append((path, t, fname, kind, i, isdef))
+                    if isdef:
+                        self.defs.setdefault(i, []).append(path)
+
+    def _check(self):
+        # (a) 引用了树里没有任何节点产生的列
+        for path, t, fname, kind, i, isdef in self.refs:
+            if not isdef and kind != 'set' and i not in self.defs:
+                self.flag(path, f"{self.colname(i)} not produced in this tree (outer ref or dangling)")
+        # (b) 用已推导属性核对：标量孩子用到的列 ⊆ 关系孩子的输出 ∪ 本节点 outer refs
+        for path, (val, t) in self.nodes.items():
+            if t.startswith("CScalar"):
+                continue
+            outs, used, ok = set(), set(), True
+            for c in _expr_children(val):
+                if c is None:
+                    continue
+                _, ct = _expr_op(c)
+                if ct is None:
+                    continue
+                if ct.startswith("CScalar"):
+                    d = _drvd_scalar(c)
+                    if not d or 'used' not in d:
+                        ok = False
+                        break
+                    used |= set(d['used'])
+                else:
+                    d = _drvd_rel(c)
+                    if not d or 'out' not in d:
+                        ok = False
+                        break
+                    outs |= set(d['out'])
+            me = _drvd_rel(val)
+            if not ok or not used or not me or 'outer' not in me:
+                continue
+            missing = used - outs - set(me['outer'])
+            if missing:
+                self.flag(path, "scalar child uses " + _ids_str(sorted(missing), self)
+                          + " not output by children nor in outer refs")
+        root = _drvd_rel(self.root)
+        if root and root.get('outer'):
+            self.notes.append(f"root has outer refs {_ids_str(root['outer'], self)}"
+                              " (fine for a correlated subtree, a bug for a whole query)")
+
+def print_cexpression_checked(root, path, props, check, paths):
+    with SilenceGDBWarnings():
+        ctx = _ExprCtx(root, props=props, check=check, paths=paths)
+        print_cexpression(_subexpr(root, path), ctx=ctx, path=path)
+        if check:
+            n = sum(len(v) for v in ctx.flags.values())
+            for note in ctx.notes:
+                print("note: " + note)
+            print(f"check: {n} problem(s)" + ("" if n == 0 else
+                  " -- marked with !! above; inspect a node with `orcaprint -p <expr> @path`"))
+
+# ---------- orcaprint colref <id|name> <expr> ----------
+
+def print_colref_usage(root, query, sub=()):
+    _subexpr(root, sub)                       # 路径不存在时报错
+    with SilenceGDBWarnings():
+        ctx = _ExprCtx(root)
+        if re.fullmatch(r'\d+', query):
+            ids = [int(query)]
+        else:
+            q = query.strip('"\'')
+            ids = sorted(i for i, n in ctx.names.items() if n == q)
+            if not ids:
+                print(f"no column named '{q}' referenced in this tree")
+                return
+        for i in ids:
+            print(f"column {ctx.colname(i)}:")
+            rows = []
+            for path, t, fname, kind, cid, isdef in ctx.refs:
+                if cid == i and path[:len(sub)] == sub:
+                    rows.append(("def" if isdef else "use", path, f"{t}.{fname}"))
+            for path, (val, t) in ctx.nodes.items():
+                if t.startswith("CScalar") or path[:len(sub)] != sub:
+                    continue
+                d = _drvd_rel(val)
+                if d and i in d.get('outer', ()):
+                    rows.append(("outer", path, f"{t}  (outer ref of this subtree)"))
+            rows.sort(key=lambda r: r[1])
+            w = max([len(_path_str(r[1])) for r in rows] + [5])
+            for role, path, what in rows:
+                print(f"  {role:<5} {_path_str(path):<{w}}  {what}")
+            if i not in ctx.defs:
+                print("  !! no node in this tree produces it"
+                      " (outer ref of a subtree, or a dangling colref)")
+
+# ---------- orcatrace：逐步 next 过一个函数，打印每一步对 CExpression 的改动 ----------
+
+def _cexpr_locals(frame):
+    """frame 里所有 CExpression* 局部变量/参数 -> 地址"""
+    res = {}
+    try:
+        blk = frame.block()
+    except RuntimeError:
+        return res
+    while blk is not None:
+        for sym in blk:
+            if not (sym.is_variable or sym.is_argument):
+                continue
+            try:
+                ty = sym.type.strip_typedefs()
+                if ty.code == gdb.TYPE_CODE_PTR and str(ty.target().strip_typedefs()) == 'gpopt::CExpression':
+                    res.setdefault(sym.name, int(sym.value(frame)))
+            except Exception:
+                pass
+        if blk.function is not None:
+            break
+        blk = blk.superblock
+    return res
+
+_SRC_CACHE = {}
+_CALLEE_RE = re.compile(r'([A-Za-z_][\w:]*)\s*\(')
+_NOT_CALLEE = {"if", "for", "while", "switch", "return", "sizeof", "GPOS_NEW", "GPOS_ASSERT",
+               "GPOS_CHECK_STACK_SIZE", "GPOS_CHECK_ABORT", "PoctxtFromTLS"}
+
+def _callee_name(symtab, first, last):
+    """源码 [first, last) 行里第一个像 Pexpr* 的调用名"""
+    fn = symtab.fullname()
+    if fn not in _SRC_CACHE:
+        try:
+            _SRC_CACHE[fn] = open(fn).read().split("\n")
+        except Exception:
+            _SRC_CACHE[fn] = []
+    src = "\n".join(_SRC_CACHE[fn][max(first - 1, 0):max(last - 1, first)])
+    names = [n for n in _CALLEE_RE.findall(src) if n.split("::")[-1] not in _NOT_CALLEE]
+    for n in names:
+        if "Pexpr" in n:
+            return n
+    return names[0] if names else None
+
+def _render(addr):
+    lines = []
+    try:
+        val = gdb.Value(addr).cast(gdb.lookup_type("gpopt::CExpression").pointer()).dereference()
+        _os_expr_lines(val, "", True, 0, lines)
+    except Exception as e:
+        lines.append(f"<cannot print: {e}>")
+    return lines
+
+class ORCATrace(gdb.Command):
+    """orcatrace [--full] [function]
+在 function（默认 gpopt::CExpressionPreprocessor::PexprPreprocess）里逐行 next，
+每当一个 CExpression* 局部变量被赋值，就把新树和上一棵树 diff 并打印，最后汇总哪些步骤改了树。
+当前不在该函数里时先在入口打临时断点再 continue。跟踪期间暂时禁用其它断点，结束后恢复。
+  --full   每个有改动的步骤打印完整的树，而不是 diff"""
+
+    def __init__(self):
+        super().__init__("orcatrace", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        import difflib
+        self.dont_repeat()
+        args = arg.split()
+        full = "--full" in args
+        args = [a for a in args if a != "--full"]
+        func = args[0] if args else "gpopt::CExpressionPreprocessor::PexprPreprocess"
+        short = func.split("::")[-1]
+
+        def frame_matches(f):
+            n = f.name() if f is not None else None
+            if n is None:
+                return False
+            return n == func or n.endswith("::" + func) or ("::" not in func and n.split("::")[-1] == func)
+
+        try:
+            frame = gdb.selected_frame()
+        except gdb.error:
+            raise gdb.GdbError("no process")
+        if not frame_matches(frame):
+            if frame_matches(gdb.newest_frame()):
+                frame = gdb.newest_frame()
+            else:
+                f = frame.older()
+                while f is not None and not frame_matches(f):
+                    f = f.older()
+                if f is not None:
+                    raise gdb.GdbError(f"{func} is an outer frame; `finish` back to it first, "
+                                       "or run orcatrace before it is called")
+                print(f"orcatrace: waiting for {func} ...")
+                gdb.execute(f"tbreak {func}", to_string=True)
+                gdb.execute("continue")
+                frame = gdb.selected_frame()
+                if not frame_matches(frame):
+                    raise gdb.GdbError(f"stopped elsewhere ({frame.name()}), not in {func}")
+
+        others = [b for b in gdb.breakpoints() if b.enabled and b.is_valid()]
+        for b in others:
+            b.enabled = False
+        steps = []
+        try:
+            vars_ = _cexpr_locals(frame)
+            # 起点：第一个 CExpression* 参数
+            cur_name, cur_addr = None, 0
+            blk = frame.block()
+            while blk is not None and blk.function is None:
+                blk = blk.superblock
+            for sym in blk or []:
+                if sym.is_argument and sym.name in vars_:
+                    cur_name, cur_addr = sym.name, vars_[sym.name]
+                    break
+            with SilenceGDBWarnings():
+                cur = _render(cur_addr) if cur_addr else []
+                print(f"== {frame.name()}  input {cur_name}: {len(cur)} lines")
+                if full:
+                    print("\n".join(cur))
+            seen_addrs = {cur_addr}
+            while True:
+                sal = frame.find_sal()
+                first = sal.line
+                before = _cexpr_locals(frame)
+                try:
+                    gdb.execute("next", to_string=True)
+                except gdb.error as e:
+                    print(f"orcatrace: stopped: {e}")
+                    break
+                if not frame.is_valid():
+                    print(f"== left {short} (returned or threw); now in {gdb.selected_frame().name()}")
+                    break
+                newest = gdb.newest_frame()
+                if newest != frame:
+                    print(f"orcatrace: stopped inside {newest.name()} (signal?); trace aborted")
+                    break
+                after = _cexpr_locals(frame)
+                last = frame.find_sal().line
+                for name, addr in after.items():
+                    if addr == before.get(name) or addr == 0:
+                        continue
+                    callee = _callee_name(sal.symtab, first, last) if sal.symtab else None
+                    if addr in seen_addrs:
+                        if callee is None:        # 纯别名赋值，如 pexprConvert2In = pexprUnnested
+                            continue
+                        steps.append((f"{callee} -> {name}", 0, 0))
+                        print(f"-- [{len(steps)}] {callee} -> {name}: unchanged (returned the same object)")
+                        continue
+                    seen_addrs.add(addr)
+                    with SilenceGDBWarnings():
+                        new = _render(addr)
+                        diff = list(difflib.unified_diff(cur, new, lineterm="", n=2))[2:]
+                        label = f"{callee or '?'} -> {name}"
+                        if not diff:
+                            steps.append((label, 0, 0))
+                            print(f"-- [{len(steps)}] {label}: unchanged")
+                        else:
+                            add = sum(1 for d in diff if d.startswith("+"))
+                            rm = sum(1 for d in diff if d.startswith("-"))
+                            steps.append((label, add, rm))
+                            print(f"-- [{len(steps)}] {label}: +{add} -{rm}  (line {first})")
+                            print("\n".join(new if full else diff))
+                    cur = new
+        finally:
+            for b in others:
+                if b.is_valid():
+                    b.enabled = True
+        changed = [(k + 1, s) for k, s in enumerate(steps) if s[1] or s[2]]
+        print(f"== {len(steps)} step(s), {len(changed)} changed the tree:")
+        for k, (label, add, rm) in changed:
+            print(f"   [{k}] {label}  +{add} -{rm}")
+
+ORCATrace()
+
 
 def print_cdparray(val, depth=0):
     """Generic pretty printer for CDynamicPtrArray<T, Cleanup*> (including nested types)."""
@@ -1206,8 +2345,26 @@ class ORCAPrint(gdb.Command):
     def invoke(self, arg, from_tty):
         # 空回车不重复执行：卡住时连按回车会排队 N 次同样的打印
         self.dont_repeat()
+        usage = ("Usage: orcaprint [-p] [--check] [-n] <expr> [@path]\n"
+                 "       orcaprint colref <colid|name> <expr> [@path]\n"
+                 "  -p       show derived props ([drvd] out/outer/keys/maxcard, used/defined;\n"
+                 "           physical: [plan] derived and [reqd] required dist/order/rewind)\n"
+                 "  --check  mark nodes referencing columns nobody produces (!!)\n"
+                 "  -n       append each node's @path\n"
+                 "  @path    print only that subtree, e.g. @1.0 = child 1 of root, then its child 0")
+        toks = arg.split()
+        colref_q = None
+        if len(toks) >= 3 and toks[0] == "colref":
+            colref_q = toks[1]
+            toks = toks[2:]
+        opts = {t for t in toks if t in ("-p", "--check", "-n")}
+        toks = [t for t in toks if t not in opts]
+        path = ()
+        if toks and toks[-1].startswith("@"):
+            path = _parse_path(toks.pop())
+        arg = " ".join(toks)
         if not arg:
-            print("Usage: orcaprint <variable>")
+            print(usage)
             return
 
         val = eval_simple(arg)
@@ -1220,6 +2377,23 @@ class ORCAPrint(gdb.Command):
             return
 
         tname = str(val.type.strip_typedefs())
+
+        if tname == 'gpopt::CQueryContext' and (colref_q is not None or opts or path):
+            val = safe_deref(val['m_pexpr'])        # 这些选项作用在 m_pexpr 上
+            if val is None:
+                print("m_pexpr is NULL")
+                return
+            tname = 'gpopt::CExpression'
+        if tname == 'gpopt::CExpression':
+            if colref_q is not None:
+                print_colref_usage(val, colref_q, path)
+                return
+            if opts or path:
+                print_cexpression_checked(val, path, "-p" in opts, "--check" in opts, "-n" in opts)
+                return
+        elif colref_q is not None or opts or path:
+            print(f"orcaprint: colref/-p/--check/-n/@path only apply to CExpression, got '{tname}'")
+            return
 
         # eliminate the warning message of "warning: RTTI symbol not found for class"
         with SilenceGDBWarnings():
@@ -1253,6 +2427,8 @@ class ORCAPrint(gdb.Command):
                 print_cteReq(val)
             elif 'CColRefSet' in tname or 'CBitSet' in tname:
                 print(_colrefset_str(val.address))
+            elif tname == 'gpopt::CQueryContext':
+                print_cquerycontext(val)
             elif 'CGroupExpression' in tname:
                 print_cgroupexpression(val)
             elif 'CExpression' in tname or 'gpopt::CExpression' in tname:
